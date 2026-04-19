@@ -8,15 +8,6 @@ Creates isolated Tor circuits for anonymous web directory fuzzing.
 - Concurrent requests with workers
 - File extension wordlist support
 
-## Installation
-```bash
-sudo dpkg -i z3rgrush_*.deb
-# or
-pip install .
-```
-
-**Requires:** `tor`, `python3-stem`, `python3-requests`
-
 ## Usage
 ```bash
 z3rgRush -t "http://example.com/{SWARM}" -w wordlist.txt
