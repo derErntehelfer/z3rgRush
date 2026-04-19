@@ -1,4 +1,38 @@
-z3rgRush - Tor-Powered Web Fuzzer
+# z3rgRush - Tor-Powered Web Fuzzer
+
+Creates isolated Tor circuits for anonymous web directory fuzzing.
+
+## Features
+- 1-16 independent Tor instances
+- Auto circuit rotation (NEWNYM)
+- Concurrent requests with workers
+- File extension wordlist support
+
+## Installation
+```bash
+sudo dpkg -i z3rgrush_*.deb
+# or
+pip install .
+```
+
+**Requires:** `tor`, `python3-stem`, `python3-requests`
+
+## Usage
+```bash
+z3rgRush -t "http://example.com/{SWARM}" -w wordlist.txt
+
+# With 5 circuits + PHP fuzzing
+z3rgRush -t "https://target.tld/admin/{SWARM}" -w common.txt -f php.txt -c 5
+```
+
+**Key args:**
+- `-t/--target`: URL with `{SWARM}` placeholder (required)
+- `-w/--wordlist`: Wordlist path (required)
+- `-c/--circuits`: 1-16 Tor circuits (default: 3)
+- `-f/--filetype`: Extensions file or single `.php`
+- `--workers`: Concurrent threads
+
+## Example Outputz3rgRush - Tor-Powered Web Fuzzer
 
 z3rgRush creates multiple isolated Tor circuits to anonymously fuzz web directories and files. Perfect for red team reconnaissance without IP exposure.
 Features
