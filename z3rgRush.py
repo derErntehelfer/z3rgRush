@@ -1,242 +1,42 @@
 #!/usr/bin/env python3
 import argparse
-import concurrent.futures
-import shutil
-import socket
-import tempfile
-import time
-import os
 import sys
-import requests
-from stem import Signal
-from stem.control import Controller
-from stem.process import launch_tor_with_config
-from contextlib import suppress
 from urllib.parse import urlparse
 
-
-def findFreePort():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+from circuitOvermind import circuitOvermind
+from payloadFactory import payloadFactory
+from torCircuitFactory import torCircuitFactory
 
 
-def validateUrl(url):
+def validateArguments(url, circuits, workers):
     parsed = urlparse(url)
+    maxCircuits = 16
+
     if not parsed.scheme or parsed.scheme not in ("http", "https"):
         print(
-            f"Error: URL must start with http:// or https:// ('{url}')", file=sys.stderr
+            f"Error: URL must start with http:// or https:// ('{url}')",
+            file=sys.stderr,
         )
         sys.exit(1)
 
+    if circuits < 1 or circuits > maxCircuits:
+        print(
+            f"Error: --circuits must be between 1 and {maxCircuits}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-def iterPayloads(target, wordlistPath, filetypes=None):
-    filetypes = filetypes or [""]
-    with open(wordlistPath, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            path = line.strip()
-            if not path:
-                continue
-            for ext in filetypes:
-                if ext.startswith("."):
-                    ext = ext.lstrip(".")
-                pathFull = path + (("." + ext) if ext else "")
-                yield target.replace("{SWARM}", pathFull, 1)
+    if workers is None:
+        return min(16, circuits)
 
+    if workers > circuits:
+        print(
+            f"Warning: limiting workers to {circuits} (same as circuits).",
+            file=sys.stderr,
+        )
+        return circuits
 
-class TorFactory:
-    def __init__(self, numberOfCircuits=3, verbose=False):
-        maxCircuits = 16
-        # Verbose flag for detailed output/debug
-        self.verbose = verbose
-
-        # Container Structures to collect Tor Circuits
-        self.circuits = []
-        self.dataDirs = []
-        self.work = []
-
-        if numberOfCircuits < 1 or numberOfCircuits > maxCircuits:
-            print(
-                f"Error: --circuits must be between 1 and {maxCircuits}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        # Generate Circuits by collecting free ports, place config in temp file Structures
-        for currentCircuitNr in range(numberOfCircuits):
-            socksPort = findFreePort()
-            controlPort = findFreePort()
-            dataDir = tempfile.mkdtemp()
-            self.dataDirs.append(dataDir)
-
-            print(
-                f"Circuit {currentCircuitNr}: Ports collected, Temp Data Structures created"
-            )
-
-            torConfig = {
-                "SocksPort": str(socksPort),
-                "ControlPort": str(controlPort),
-                "DataDirectory": dataDir,
-                "CookieAuthentication": "1",
-                "ExitPolicy": "reject *:*",
-                "Log": ["NOTICE stdout"] if verbose else [],
-            }
-
-            try:
-                torProcess = launch_tor_with_config(config=torConfig)
-            except Exception as e:
-                print(
-                    f"Error starting Tor process for circuit {currentCircuitNr}: {e}",
-                    file=sys.stderr,
-                )
-                self.cleanupAll()
-                sys.exit(1)
-
-            print(f"Circuit {currentCircuitNr}: Tor Process launched")
-
-            controller = Controller.from_port(port=controlPort)
-            try:
-                controller.authenticate()
-            except Exception as e:
-                print(
-                    f"Error authenticating controller on port {controlPort}: {e}",
-                    file=sys.stderr,
-                )
-                controller.close()
-                torProcess.kill()
-                self.cleanupSingle(dataDir)
-                sys.exit(1)
-
-            print(
-                f"Circuit {currentCircuitNr}: Tor Process authenticated, waiting for bootstrap"
-            )
-
-            self.waitForBootstrap(controller, currentCircuitNr)
-            self.circuits.append((torProcess, controller, socksPort, dataDir))
-
-    def waitForBootstrap(self, controller, currentCircuitNr):
-        while True:
-            status = controller.get_info("status/bootstrap-phase")
-            print(f"Circuit {currentCircuitNr}: {status}")
-            if "100" in status:
-                break
-            time.sleep(1)
-
-    def fetchWithCircuit(self, fuzzed, circuitIndex, timeout=10):
-        torProcess, controller, socksPort, dataDir = self.circuits[circuitIndex]
-
-        proxies = {
-            "http": f"socks5h://127.0.0.1:{socksPort}",
-            "https": f"socks5h://127.0.0.1:{socksPort}",
-        }
-
-        controller.signal(Signal.NEWNYM)
-        time.sleep(0.5)
-
-        try:
-            ipResponse = requests.get(
-                "http://httpbin.org/ip", proxies=proxies, timeout=timeout
-            )
-            exitIp = ipResponse.json().get("origin", "unknown")
-        except Exception as ipError:
-            exitIp = f"IP fetch error: {ipError}"
-
-        try:
-            response = requests.get(fuzzed, proxies=proxies, timeout=timeout)
-            print(
-                f"Circuit {circuitIndex} (port {socksPort}): "
-                f"IP={exitIp}, status={response.status_code}, len={len(response.content)} "
-                f"-> URL: {fuzzed}"
-            )
-            return (True, None)
-        except Exception as e:
-            print(
-                f"Circuit {circuitIndex} (port {socksPort}): "
-                f"IP={exitIp}, error -> {e} "
-                f"(URL: {fuzzed})"
-            )
-            print(f"Payload {fuzzed} returned to Work Container")
-            return (False, fuzzed)
-
-    def loadFiletypes(self, filetypeArg):
-        if not filetypeArg:
-            return [""]
-        if os.path.isfile(filetypeArg):
-            try:
-                with open(filetypeArg, "r") as f:
-                    extensions = [line.strip() for line in f if line.strip()]
-                if not extensions:
-                    print(f"Error: {filetypeArg} is empty.", file=sys.stderr)
-                    sys.exit(1)
-                return extensions
-            except Exception as e:
-                print(f"Error reading {filetypeArg}: {e}", file=sys.stderr)
-                sys.exit(1)
-        # Treat as a single extension if not a file
-        return [filetypeArg]
-
-    def generatePayloads(
-        self,
-        target,
-        wordlistPath,
-        maxWorkers=None,
-        filetypeArg=None,
-        timeout=10,
-    ):
-        if maxWorkers is None:
-            maxWorkers = min(16, len(self.circuits))
-
-        if maxWorkers > len(self.circuits):
-            print(
-                f"Warning: limiting workers to {len(self.circuits)} (same as circuits).",
-                file=sys.stderr,
-            )
-            maxWorkers = len(self.circuits)
-
-        filetypes = self.loadFiletypes(filetypeArg)
-        self.work = list(iterPayloads(target, wordlistPath, filetypes))
-        # Prepare (fuzzedTarget, circuitIndex) for each request
-        # Flatten all (path + filetype) into a single list
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=maxWorkers) as exec:
-            futures = [
-                exec.submit(
-                    self.fetchWithCircuit,
-                    fuzzed,
-                    circuitIndex=i % len(self.circuits),
-                )
-                for i, fuzzed in enumerate(self.work)
-            ]
-            # Process results & retry failed ones
-            for future in concurrent.futures.as_completed(futures):
-                success, failedPayload = future.result()
-                if not success and failedPayload:
-                    self.work.append(failedPayload)
-
-            concurrent.futures.wait(futures)
-
-    def cleanupSingle(self, dataDir):
-        with suppress(Exception):
-            shutil.rmtree(dataDir, ignore_errors=True)
-
-    def cleanupAll(self):
-        for torProcess, controller, socksPort, dataDir in self.circuits:
-            with suppress(Exception):
-                controller.close()
-            if torProcess is not None:
-                try:
-                    torProcess.wait(timeout=5)
-                except Exception:
-                    try:
-                        torProcess.kill()
-                        torProcess.wait(timeout=1)
-                    except Exception:
-                        pass
-            self.cleanupSingle(dataDir)
-
-    def close(self):
-        for torProcess, controller, socksPort, dataDir in self.circuits:
-            self.cleanupAll()
+    return workers
 
 
 def main():
@@ -282,11 +82,12 @@ def main():
         "-v",
         "--verbose",
         action="store_true",
-        help="Enable verbose output (bootstrap‑phase logs)",
+        help="Enable verbose output (bootstrap-phase logs)",
     )
 
     args = parser.parse_args()
-    validateUrl(args.target)
+    args.workers = validateArguments(args.target, args.circuits, args.workers)
+
     art = [
         "||--------------------||",
         "||",
@@ -304,17 +105,23 @@ def main():
         "",
     ]
     print("\n".join(art))
-    factory = TorFactory(
+
+    torFactory = torCircuitFactory(
         numberOfCircuits=args.circuits,
         verbose=args.verbose,
     )
+    _payloadFactory = payloadFactory()
+    overmind = circuitOvermind(torFactory)
 
     try:
-        factory.generatePayloads(
+        payloads = _payloadFactory.generatePayloads(
             args.target,
             args.wordlist,
-            maxWorkers=args.workers,
             filetypeArg=args.filetype,
+        )
+        overmind.sendPayloads(
+            payloads,
+            workers=args.workers,
             timeout=args.timeout,
         )
     except KeyboardInterrupt:
@@ -322,7 +129,7 @@ def main():
     except Exception as e:
         print(f"Aborting: {e}", file=sys.stderr)
     finally:
-        factory.cleanupAll()
+        torFactory.cleanupAll()
         print("Cleanup done, exiting.", file=sys.stderr)
 
 
