@@ -4,11 +4,11 @@ CLI tool that sends HTTP requests through multiple Tor circuits. Uses wordlists 
 
 ## Files
 
-- `z3rgRush.py` - Main CLI entry point[file:5]
-- `torCircuitFactory.py` - Creates isolated Tor instances[file:4] 
-- `circuitOvermind.py` - Manages requests across circuits with header rotation[file:3]
-- `payloadFactory.py` - Generates fuzzing payloads from wordlists[file:2]
-- `headersForRotation.json` - Browser headers for rotation[file:1]
+- `z3rgRush.py` - Main CLI entry point
+- `torCircuitFactory.py` - Creates isolated Tor instances
+- `circuitOvermind.py` - Manages requests across circuits with header rotation
+- `payloadFactory.py` - Generates fuzzing payloads from wordlists
+- `headersForRotation.json` - Browser headers for rotation
 
 ## Requirements
 
@@ -30,7 +30,7 @@ python3 z3rgRush.py -t "https://example.com/SWARM" -w wordlist.txt -c 3
 - `--post-data` Use wordlist as POST body
 - `--headers` JSON file or `Key:Value` pairs
 - `-v` Verbose output
-- `-rc` Return codes to collect (default 200)[file:5]
+- `-rc` Return codes to collect (default 200)
 
 ## Install
 
@@ -38,7 +38,7 @@ python3 z3rgRush.py -t "https://example.com/SWARM" -w wordlist.txt -c 3
 2. `pip install requests stem`
 3. Run `python3 z3rgRush.py -h`
 
-Tor uses temporary data directories (auto cleaned).[file:4]
+Tor uses temporary data directories (auto cleaned).
 
 ## Example
 
@@ -52,7 +52,7 @@ python3 z3rgRush.py -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 -
 Circuit 0: Tor Process launched
 ...
 ------ Collected Results ------
-{'Circuit': 2, 'method': 'GET', 'port': 9053, 'IP': '185.220.101.XX', 'status': 200, 'len': 1234, 'fURL': 'https://target.com/admin.php'}
+{'Circuit': 2, 'method': 'GET', 'port': 9053, 'IP': '185.220.101.XX', 'status': 200, 'len': 1234, 'URL': 'https://target.com/admin.php'}
 ```
 
 
