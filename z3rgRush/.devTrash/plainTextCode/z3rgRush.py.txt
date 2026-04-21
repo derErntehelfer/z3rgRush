@@ -84,16 +84,7 @@ def parseHeadersArg(headersArg):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="z3rgRush - Tor-powered web fuzzer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
-  z3rgRush -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 --workers 10
-  z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data --method POST
-        """,
-    )
+    parser = argparse.ArgumentParser(description="z3rgRush - Tor-powered web fuzzer")
     parser.add_argument(
         "-t",
         "--target",
@@ -163,7 +154,7 @@ Examples:
         "--return_codes",
         nargs="*",
         default=[200],
-        help="HTTP status codes considered successful (default: 200)",
+        help="",
     )
 
     args = parser.parse_args()
