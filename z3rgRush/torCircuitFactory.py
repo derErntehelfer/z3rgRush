@@ -18,9 +18,9 @@ class torCircuitFactory:
             circuitBuildRetries = 3
             self.generateCircuit(currentCircuitNr, circuitBuildRetries)
 
-    def findFreePort(self):
+    def findFreePort(self, host="127.0.0.1"):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("", 0))
+            sock.bind((host, 0))
             return sock.getsockname()[1]
 
     def generateCircuit(self, currentCircuitNr, circuitBuildRetries):

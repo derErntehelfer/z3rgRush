@@ -205,9 +205,7 @@ Examples:
         torFactory,
         headersInfo=headersInfo,
         verbose=args.verbose,
-        returnCodes=[
-            int(code.strip(","), code.strip(" ")) for code in args.return_codes
-        ],
+        returnCodes=[int(code.replace(",", "").strip()) for code in args.return_codes],
     )
 
     try:
