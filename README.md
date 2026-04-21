@@ -40,3 +40,6 @@ z3rgRush.py -t TARGET -w WORDLIST [-c CIRCUITS] [--workers N] [-f EXTS] [-v]
 **Output:** Circuit/IP/status/size/URL for hits (200,403,etc).
 
 **Author:** derErntehelfer
+
+**Note:** 
+Tool was developed with use of genAI. That does not mean that any code was used without understanding and testing it, nor that the tool itself, its purpose or design choices were made by an LLM. 
