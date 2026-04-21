@@ -87,12 +87,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # TODO Format this better
         epilog="""
 Examples:
-  z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
-  z3rgRush -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 --workers 10
-  z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data --method POST
-        """,
+    z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
+    z3rgRush -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 --workers 10
+    z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data --method POST
+""",
     )
     parser.add_argument(
         "-t",
@@ -175,7 +176,7 @@ Examples:
         if ":" in h:
             key, value = h.split(":", 1)
             customHeaders[key.strip()] = value.strip()
-
+    # TODO Format this better, maybe move to file
     art = [
         "||--------------------||",
         "||",
