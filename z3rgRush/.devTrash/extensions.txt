@@ -1,0 +1,3 @@
+.pdf
+.php
+.txt
