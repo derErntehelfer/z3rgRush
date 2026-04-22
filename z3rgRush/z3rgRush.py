@@ -83,6 +83,16 @@ def parseHeadersArg(headersArg):
     return {"file": None, "config": None, "custom": customHeaders}
 
 
+def parseCodes(codesArg):
+    if isinstance(codesArg, int):
+        return [codesArg]
+    if isinstance(codesArg, list):
+        return [int(code.strip()) for code in codesArg if code.strip().isdigit()]
+    return [
+        int(code.strip()) for code in str(codesArg).split(",") if code.strip().isdigit()
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
@@ -161,10 +171,16 @@ Examples:
     )
     parser.add_argument(
         "-rc",
-        "--return_codes",
+        "--return-codes",
         nargs="*",
         default=[200],
         help="HTTP status codes considered successful (default: 200)",
+    )
+    parser.add_argument(
+        "-ep",
+        "--use-exit-proxies",
+        action="store_true",
+        help="Use exit proxies chained after Tor circuits (default: False)",
     )
 
     args = parser.parse_args()
@@ -195,6 +211,7 @@ Examples:
     ]
     print("\n".join(art))
 
+    _returnCodes = parseCodes(args.return_codes)
     headersInfo = parseHeadersArg(args.headers)
     torFactory = torCircuitFactory(
         numberOfCircuits=args.circuits,
@@ -205,7 +222,8 @@ Examples:
         torFactory,
         headersInfo=headersInfo,
         verbose=args.verbose,
-        returnCodes=[int(code.replace(",", "").strip()) for code in args.return_codes],
+        returnCodes=_returnCodes,
+        useExitProxies=args.use_exit_proxies,
     )
 
     try:
@@ -223,8 +241,10 @@ Examples:
             method=args.method,
             postData=args.post_data,
             customHeaders=customHeaders,
+            useExitProxies=args.use_exit_proxies,
         )
     except KeyboardInterrupt:
+        overmind.stopping = True
         print("\nCtrl+C received, shutting down Tor circuits...")
     except Exception as e:
         print(f"Aborting: {e}", file=sys.stderr)
