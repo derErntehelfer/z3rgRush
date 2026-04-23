@@ -155,6 +155,15 @@ class circuitOvermind:
         torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
             circuitIndex
         ]
+
+        controller.signal(Signal.NEWNYM)
+        time.sleep(0.5)
+        codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
+
+        headers = self.getNextHeaders()
+        if customHeaders:
+            headers.update(customHeaders)
+
         if self.useProxyExit:
             availableProxies = [
                 p for p in self.upstreamProxies if p not in self.badProxies
@@ -184,13 +193,6 @@ class circuitOvermind:
         socks.setdefaultproxy()  # Clear previous chain
         for hop in chain:
             socks.adddefaultproxy(*socks.parseproxy(hop))
-        controller.signal(Signal.NEWNYM)
-        time.sleep(0.5)
-        codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
-
-        headers = self.getNextHeaders()
-        if customHeaders:
-            headers.update(customHeaders)
 
         if self.useProxyExit and "upstreamProxy" in locals():
             exitIp = f"Tor+Proxy({upstreamProxy.split('://')[1] if '://' in upstreamProxy else upstreamProxy})"
