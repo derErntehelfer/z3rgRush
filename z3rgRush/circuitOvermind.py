@@ -295,11 +295,14 @@ class circuitOvermind:
                                 customHeaders=customHeaders,
                             )
                         )
-
-                for future in concurrent.futures.as_completed(futures):
-                    success, failedPayload = future.result()
-                    if not success and failedPayload:
-                        work.append(failedPayload)
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        success, failedPayload = future.result()
+                        if not success and failedPayload:
+                            work.append(failedPayload)
+                except KeyboardInterrupt:
+                    executor.shutdown(cancel_futures=True, wait=False)
+                    raise
             maxRetries -= 1
 
         if work:
