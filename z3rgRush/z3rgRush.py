@@ -161,10 +161,17 @@ Examples:
     )
     parser.add_argument(
         "-rc",
-        "--return_codes",
+        "--return-codes",
         nargs="*",
         default=[200],
         help="HTTP status codes considered successful (default: 200)",
+    )
+    parser.add_argument(
+        "-ep",
+        "--use-exit-proxy",
+        action="store_true",
+        default=False,
+        help="",
     )
 
     args = parser.parse_args()
@@ -206,6 +213,7 @@ Examples:
         headersInfo=headersInfo,
         verbose=args.verbose,
         returnCodes=[int(code.replace(",", "").strip()) for code in args.return_codes],
+        proxySet=args.use_exit_proxy,
     )
 
     try:
