@@ -205,9 +205,13 @@ class circuitOvermind:
             response = methodFunction(  # <-- Empty proxies=!
                 fuzzed, headers=headers, timeout=timeout, data=data, **kwargs
             )
-            if self.verbose:
+            if self.verbose and self.useProxyExit:
                 print(
                     f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {fuzzed}"
+                )
+            elif self.verbose:
+                print(
+                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {fuzzed}"
                 )
             resultToCollect = (
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
