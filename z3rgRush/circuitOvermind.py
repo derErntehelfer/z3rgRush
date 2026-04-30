@@ -27,6 +27,10 @@ class circuitOvermind:
         proxySet=False,
     ):
         self.torFactory = torFactory
+        self.sessions = {}
+        for circuits in range(len(self.torFactory.circuits)):
+            session = requests.Session()
+            self.sessions[circuits] = session
         self.headerIndex = 0
         self.returnCodes = returnCodes
         self.verbose = verbose
@@ -201,10 +205,11 @@ class circuitOvermind:
             exitIp = self.getExitIp({}, timeout, headers)
             proxyChain = {}
         try:
-            methodFunction = getattr(requests, method.lower())
-            response = methodFunction(  # <-- Empty proxies=!
-                fuzzed, headers=headers, timeout=timeout, data=data, **kwargs
+            session = self.sessions[circuitIndex]
+            response = session.request(
+                method, fuzzed, headers=headers, timeout=timeout, data=data, **kwargs
             )
+
             if self.verbose and self.useProxyExit:
                 print(
                     f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {fuzzed}"
