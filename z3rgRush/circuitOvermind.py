@@ -4,8 +4,9 @@ import socket
 import time
 import builtins
 import subprocess
-import pyChainedProxy as socks
 import requests
+
+import pyChainedProxy as socks
 from stem import Signal
 
 
@@ -54,6 +55,14 @@ class circuitOvermind:
             self.headerSets = {
                 "user_agents": ["Mozilla/5.0 (compatible; z3rgRush/1.0)"],
                 "accept_headers": ["*/*"],
+                "accept_languages": ["en-US,en;q=0.9"],
+                "accept_encodings": ["gzip, deflate, br"],
+                "referers": ["https://www.google.com/"],
+                "sec_fetch_dest": ["document"],
+                "sec_fetch_mode": ["navigate"],
+                "sec_fetch_site": ["same-origin"],
+                "sec_ch_ua_mobile": ["?0"],
+                "sec_ch_ua_platforms": ['"Windows"'],
             }
             print("No headers config loaded, using minimal defaults")
 
@@ -148,17 +157,18 @@ class circuitOvermind:
 
     def fetchWithCircuit(
         self,
-        fuzzed,
+        requestSpec,
         circuitIndex,
-        method="GET",
         data=None,
         timeout=10,
         customHeaders=None,
-        **kwargs,
+        requestKwargs=None,
     ):
         torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
             circuitIndex
         ]
+
+        requestKwargs = requestKwargs or {}
 
         controller.signal(Signal.NEWNYM)
         time.sleep(0.5)
@@ -167,6 +177,10 @@ class circuitOvermind:
         headers = self.getNextHeaders()
         if customHeaders:
             headers.update(customHeaders)
+
+        url = requestSpec.get("url")
+        method = requestSpec.get("method", "GET")
+        data = requestSpec.get("data", None)
 
         if self.useProxyExit:
             availableProxies = [
@@ -207,60 +221,64 @@ class circuitOvermind:
         try:
             session = self.sessions[circuitIndex]
             response = session.request(
-                method, fuzzed, headers=headers, timeout=timeout, data=data, **kwargs
+                method=method,
+                url=url,
+                headers=headers,
+                timeout=timeout,
+                data=data,
+                **requestKwargs,
             )
 
             if self.verbose and self.useProxyExit:
                 print(
-                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {fuzzed}"
+                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {url}"
                 )
             elif self.verbose:
                 print(
-                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {fuzzed}"
+                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {url}"
                 )
             resultToCollect = (
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
                 f"IP={exitIp}, status={response.status_code}, len={len(response.content)} "
-                f"(URL: {fuzzed})"
+                f"(URL: {url})"
             )
             print(resultToCollect)
             self.printHeadersVerbose(headers)
             if response.status_code in codesForRetry:
                 print(
-                    f"Overmind: Payload {fuzzed} returned to Work Container - Response Status"
+                    f"Overmind: Payload {url} returned to Work Container - Response Status"
                 )
-                return (False, fuzzed)
+                return (False, requestSpec)
             if response.status_code in self.returnCodes:
                 self.collectedOutput.append(resultToCollect)
             return (True, None)
         except requests.exceptions.Timeout:
             self.badProxies.add(upstreamProxy)
             print(f"[BAD PROXY] {upstreamProxy} timed out - blacklisted")
-            return False, fuzzed
+            return (False, requestSpec)
         except requests.exceptions.ConnectionError as ce:
             if "refused" in str(ce).lower() or "reset" in str(ce).lower():
                 self.badProxies.add(upstreamProxy)
                 print(
                     f"[BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
                 )
-            return False, fuzzed
+            return (False, requestSpec)
         except Exception as e:
             print(
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
                 f"IP={exitIp}, error -> {e} "
-                f"(URL: {fuzzed})"
+                f"(URL: {url})"
             )
             print(
-                f"Overmind: Payload {fuzzed} returned to Work Container - Failed to Send"
+                f"Overmind: Payload {url} returned to Work Container - Failed to Send"
             )
-            return (False, fuzzed)
+            return (False, requestSpec)
 
     def sendPayloads(
         self,
         payloads,
         workers=None,
         timeout=10,
-        method="GET",
         postData=False,
         customHeaders=None,
         exitEvent=None,
@@ -285,39 +303,39 @@ class circuitOvermind:
                 ) as executor:
                     futures = []
                     for i, payload in enumerate(currentWork):
-                        if postData and isinstance(payload, tuple):
+                        if isinstance(payload, dict):
+                            requestSpec = payload
+                        elif postData and isinstance(payload, tuple):
                             url, postDataValue = payload
-                            futures.append(
-                                executor.submit(
-                                    self.fetchWithCircuit,
-                                    url,
-                                    i % len(self.torFactory.circuits),
-                                    method=method,
-                                    data=postDataValue,
-                                    timeout=timeout,
-                                    customHeaders=customHeaders,
-                                )
-                            )
+                            requestSpec = {
+                                "url": url,
+                                "data": postDataValue,
+                                "method": "POST",
+                                "payload": postDataValue,
+                            }
                         else:
-                            futures.append(
-                                executor.submit(
-                                    self.fetchWithCircuit,
-                                    payload,
-                                    i % len(self.torFactory.circuits),
-                                    method=method,
-                                    timeout=timeout,
-                                    customHeaders=customHeaders,
-                                )
+                            requestSpec = {
+                                "url": payload,
+                                "data": None,
+                                "method": "GET",
+                                "payload": payload,
+                            }
+
+                        futures.append(
+                            executor.submit(
+                                self.fetchWithCircuit,
+                                requestSpec,
+                                i % len(self.torFactory.circuits),
+                                timeout=timeout,
+                                customHeaders=customHeaders,
                             )
+                        )
 
                     for future in concurrent.futures.as_completed(futures):
                         success, failedPayload = future.result()
-                        if exitEvent and exitEvent.is_set():
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            break
-
                         if not success and failedPayload:
                             work.append(failedPayload)
+
                 maxRetries -= 1
             except KeyboardInterrupt:
                 executor.shutdown(wait=False, cancel_futures=True)

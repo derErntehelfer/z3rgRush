@@ -95,7 +95,7 @@ def main():
 Examples:
     z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
     z3rgRush -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 --workers 10
-    z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data --method POST
+    z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data
 """,
     )
     parser.add_argument(
@@ -142,13 +142,6 @@ Examples:
         help="Enable verbose output (bootstrap-phase logs)",
     )
     parser.add_argument(
-        "-m",
-        "--method",
-        choices=["GET", "POST", "PUT", "HEAD"],
-        default="GET",
-        help="HTTP method (default: GET)",
-    )
-    parser.add_argument(
         "--post-data",
         action="store_true",
         default=None,
@@ -175,7 +168,7 @@ Examples:
         "--use-exit-proxy",
         action="store_true",
         default=False,
-        help="",
+        help="Use additonal Exit proxies to hide Tor Exit Nodes (experimental)",
     )
 
     args = parser.parse_args()
@@ -233,7 +226,6 @@ Examples:
             payloadGenerator,
             workers=args.workers,
             timeout=args.timeout,
-            method=args.method,
             postData=args.post_data,
             customHeaders=customHeaders,
             exitEvent=exitEvent,

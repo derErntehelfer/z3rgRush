@@ -30,13 +30,22 @@ class payloadFactory:
                     if ext.startswith("."):
                         ext = ext.lstrip(".")
                     pathFull = path + (("." + ext) if ext else "")
-                    payload = target.replace("{SWARM}", pathFull, 1)
 
                     if postData:
-                        # For POST, yield URL and payload as data
-                        yield payload, pathFull
+                        yield {
+                            "url": target,
+                            "data": pathFull,
+                            "method": "POST",
+                            "payload": pathFull,
+                        }
                     else:
-                        yield payload
+                        requestUrl = target.replace("{SWARM}", pathFull, 1)
+                        yield {
+                            "url": requestUrl,
+                            "data": None,
+                            "method": "GET",
+                            "payload": requestUrl,
+                        }
 
     def generatePayloads(self, target, wordlistPath, filetypeArg=None, postData=False):
         filetypes = self.loadFiletypes(filetypeArg)
