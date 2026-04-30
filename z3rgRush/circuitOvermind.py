@@ -11,10 +11,8 @@ from urllib.parse import urlparse
 
 
 def quietPrint(*args, **kwargs):
-    # Convert args to string FIRST (no recursion)
     msg = " ".join(str(arg) for arg in args)
     if "Python 3" not in msg:
-        # Call ORIGINAL print (saved before patch)
         builtins._original_print(*args, **kwargs)
 
 
@@ -29,18 +27,22 @@ class circuitOvermind:
     ):
         self.torFactory = torFactory
         self.sessions = {}
+
         for circuits in range(len(self.torFactory.circuits)):
             session = requests.Session()
             self.sessions[circuits] = session
+
         self.headerIndex = 0
         self.returnCodes = returnCodes
         self.verbose = verbose
         self.collectedOutput = []
         self.useProxyExit = proxySet
+
         if self.useProxyExit:
             self.upstreamProxies = self.collectProxyscrapeProxies()
             self.badProxies = set()
             print(f"Overmind: Collected {len(self.upstreamProxies)} upstream proxies")
+
         socket.socket = socks.socksocket
         socks.setproxy("localhost", socks.PROXY_TYPE_NONE)
         socks.setproxy("127.0.0.1", socks.PROXY_TYPE_NONE)
@@ -81,12 +83,14 @@ class circuitOvermind:
                     for line in result.stdout.strip().split("\n")
                     if ":" in line
                 ]
+
                 proxies = []
                 for line in proxyLines:
                     if ":" in line:
                         ip, port = line.rsplit(":", 1)
                         proxies.append(f"http://{ip}:{port}")
-                return proxies[:50]  # Limit to 50 fast ones
+
+                return proxies[:50]
         except Exception as e:
             print(f"Proxy collection failed: {e}")
 
@@ -193,6 +197,7 @@ class circuitOvermind:
         if self.useProxyExit:
             if exitEvent is not None and exitEvent.is_set():
                 return False, requestSpec
+
             availableProxies = [
                 p for p in self.upstreamProxies if p not in self.badProxies
             ]
@@ -202,7 +207,7 @@ class circuitOvermind:
                 self.badProxies.clear()
                 availableProxies = self.upstreamProxies
             upstreamProxy = random.choice(availableProxies)
-            # Parse upstream proxy (ip:port -> host, port)
+
             parsed = urlparse(upstreamProxy)
             if parsed.scheme and parsed.hostname and parsed.port:
                 host = parsed.hostname
@@ -213,14 +218,11 @@ class circuitOvermind:
                 port = int(port_str)
                 host = host.strip()[5:] if host.startswith("http") else host.strip()
 
-            chain = [
-                f"socks5://127.0.0.1:{socksPort}/",  # 1st hop: This circuit's Tor
-                upstreamProxy + "/",  # 2nd hop: Random upstream HTTP
-            ]
+            chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
+
         else:
-            chain = [
-                f"socks5://127.0.0.1:{socksPort}/",  # 1st hop: This circuit's Tor
-            ]
+            chain = [f"socks5://127.0.0.1:{socksPort}/"]
+
         socks.setdefaultproxy()  # Clear previous chain
         for hop in chain:
             socks.adddefaultproxy(*socks.parseproxy(hop))
@@ -231,6 +233,7 @@ class circuitOvermind:
         else:
             exitIp = self.getExitIp({}, timeout, headers)
             proxyChain = {}
+
         try:
             session = self.sessions[circuitIndex]
             response = session.request(
@@ -250,6 +253,7 @@ class circuitOvermind:
                 print(
                     f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {url}"
                 )
+
             resultToCollect = (
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
                 f"IP={exitIp}, status={response.status_code}, len={len(response.content)} "
@@ -257,6 +261,7 @@ class circuitOvermind:
             )
             print(resultToCollect)
             self.printHeadersVerbose(headers)
+
             if response.status_code in codesForRetry:
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Response Status"
@@ -264,7 +269,9 @@ class circuitOvermind:
                 return (False, requestSpec)
             if response.status_code in self.returnCodes:
                 self.collectedOutput.append(resultToCollect)
+
             return (True, None)
+
         except requests.exceptions.Timeout:
             self.badProxies.add(upstreamProxy)
             print(f"[BAD PROXY] {upstreamProxy} timed out - blacklisted")
