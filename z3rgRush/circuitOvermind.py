@@ -202,7 +202,7 @@ class circuitOvermind:
                 p for p in self.upstreamProxies if p not in self.badProxies
             ]
             if not availableProxies:
-                print("All upstream proxies failed - refetching...")
+                print("Overmind: All upstream proxies failed - refetching...")
                 self.upstreamProxies = self.collectProxyscrapeProxies()
                 self.badProxies.clear()
                 availableProxies = self.upstreamProxies
@@ -262,7 +262,7 @@ class circuitOvermind:
             print(resultToCollect)
             self.printHeadersVerbose(headers)
 
-            if response.status_code in codesForRetry:
+            if response.status_code in codesForRetry and not exitEvent.is_set():
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Response Status"
                 )
@@ -273,25 +273,41 @@ class circuitOvermind:
             return (True, None)
 
         except requests.exceptions.Timeout:
-            self.badProxies.add(upstreamProxy)
-            print(f"[BAD PROXY] {upstreamProxy} timed out - blacklisted")
+            if not exitEvent.is_set():
+                if self.useProxyExit:
+                    self.badProxies.add(upstreamProxy)
+                    print(
+                        f"Overmind: Payload {url} returned to Work Container - [BAD PROXY] {upstreamProxy} timed out - blacklisted"
+                    )
+                else:
+                    print(
+                        f"Overmind: Payload {url} returned to Work Container - Timed out"
+                    )
             return (False, requestSpec)
         except requests.exceptions.ConnectionError as ce:
             if "refused" in str(ce).lower() or "reset" in str(ce).lower():
-                self.badProxies.add(upstreamProxy)
-                print(
-                    f"[BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
-                )
+                if not exitEvent.is_set():
+                    if self.useProxyExit:
+                        self.badProxies.add(upstreamProxy)
+                        print(
+                            f"Overmind: Payload {url} returned to Work Container - [BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
+                        )
+                    else:
+                        print(
+                            f"Overmind: Payload {url} returned to Work Container - Connection refused"
+                        )
+
             return (False, requestSpec)
         except Exception as e:
-            print(
-                f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
-                f"IP={exitIp}, error -> {e} "
-                f"(URL: {url})"
-            )
-            print(
-                f"Overmind: Payload {url} returned to Work Container - Failed to Send"
-            )
+            if not exitEvent.is_set():
+                print(
+                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
+                    f"IP={exitIp}, error -> {e} "
+                    f"(URL: {url})"
+                )
+                print(
+                    f"Overmind: Payload {url} returned to Work Container - Failed to Send"
+                )
             return (False, requestSpec)
 
     def sendPayloads(
@@ -388,3 +404,4 @@ class circuitOvermind:
                 print(outputs)
         else:
             print("No Results Collected")
+        print("------ Collected Results ------")
