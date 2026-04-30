@@ -273,41 +273,44 @@ class circuitOvermind:
                     if "Python 3" in " ".join(map(str, args))
                     else builtins._original_print(*args, **kwargs)
                 )
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = []
-                for i, payload in enumerate(currentWork):
-                    if postData and isinstance(payload, tuple):
-                        url, postDataValue = payload
-                        futures.append(
-                            executor.submit(
-                                self.fetchWithCircuit,
-                                url,
-                                i % len(self.torFactory.circuits),
-                                method=method,
-                                data=postDataValue,
-                                timeout=timeout,
-                                customHeaders=customHeaders,
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers
+                ) as executor:
+                    futures = []
+                    for i, payload in enumerate(currentWork):
+                        if postData and isinstance(payload, tuple):
+                            url, postDataValue = payload
+                            futures.append(
+                                executor.submit(
+                                    self.fetchWithCircuit,
+                                    url,
+                                    i % len(self.torFactory.circuits),
+                                    method=method,
+                                    data=postDataValue,
+                                    timeout=timeout,
+                                    customHeaders=customHeaders,
+                                )
                             )
-                        )
-                    else:
-                        futures.append(
-                            executor.submit(
-                                self.fetchWithCircuit,
-                                payload,
-                                i % len(self.torFactory.circuits),
-                                method=method,
-                                timeout=timeout,
-                                customHeaders=customHeaders,
+                        else:
+                            futures.append(
+                                executor.submit(
+                                    self.fetchWithCircuit,
+                                    payload,
+                                    i % len(self.torFactory.circuits),
+                                    method=method,
+                                    timeout=timeout,
+                                    customHeaders=customHeaders,
+                                )
                             )
-                        )
 
-                for future in concurrent.futures.as_completed(futures):
-                    success, failedPayload = future.result()
-                    if not success and failedPayload:
-                        work.append(failedPayload)
-            maxRetries -= 1
-
+                    for future in concurrent.futures.as_completed(futures):
+                        success, failedPayload = future.result()
+                        if not success and failedPayload:
+                            work.append(failedPayload)
+                maxRetries -= 1
+            except KeyboardInterrupt:
+                print("\nCtrl+C received, shutting down Tor circuits...")
         if work:
             print(f"Failed payloads after {maxRetries} retries: {len(work)}")
 
