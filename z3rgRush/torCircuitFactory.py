@@ -25,9 +25,8 @@ class torCircuitFactory:
 
     def generateCircuit(self, currentCircuitNr, circuitBuildRetries):
         if circuitBuildRetries <= 0:
-            print("Circuit Factory: Max Retries reached. Shutting Down")
-            self.cleanupAll()
-            sys.exit(1)
+            print("Circuit Factory: Max Retries reached. Raising error for cleanup.")
+            raise RuntimeError("Failed to build all circuits after retries")
 
         circuitBuildRetries = circuitBuildRetries
         socksPort = self.findFreePort()

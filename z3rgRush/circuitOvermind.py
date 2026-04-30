@@ -5,9 +5,9 @@ import time
 import builtins
 import subprocess
 import requests
-
 import pyChainedProxy as socks
 from stem import Signal
+from urllib.parse import urlparse
 
 
 def quietPrint(*args, **kwargs):
@@ -162,6 +162,7 @@ class circuitOvermind:
         data=None,
         timeout=10,
         customHeaders=None,
+        exitEvent=None,
         requestKwargs=None,
     ):
         torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
@@ -169,6 +170,9 @@ class circuitOvermind:
         ]
 
         requestKwargs = requestKwargs or {}
+
+        if exitEvent is not None and exitEvent.is_set():
+            return False, requestSpec
 
         controller.signal(Signal.NEWNYM)
         time.sleep(0.5)
@@ -193,12 +197,15 @@ class circuitOvermind:
                 availableProxies = self.upstreamProxies
             upstreamProxy = random.choice(availableProxies)
             # Parse upstream proxy (ip:port -> host, port)
-            if "://" in upstreamProxy:
-                parsed = upstreamProxy.split("://")[1]
+            parsed = urlparse(upstreamProxy)
+            if parsed.scheme and parsed.hostname and parsed.port:
+                host = parsed.hostname
+                port = parsed.port
             else:
-                parsed = upstreamProxy
-            host, port = parsed.rsplit(":", 1)
-            port = int(port)
+                # Fallback: ip:port
+                host, port_str = upstreamProxy.rsplit(":", 1)
+                port = int(port_str)
+                host = host.strip()[5:] if host.startswith("http") else host.strip()
 
             chain = [
                 f"socks5://127.0.0.1:{socksPort}/",  # 1st hop: This circuit's Tor
@@ -286,8 +293,8 @@ class circuitOvermind:
         work = list(payloads)
         maxRetries = 3  # Add retry limit
 
-        while work and maxRetries > 0:
-            currentWork = work
+        while work and maxRetries > 0 and (exitEvent is None or not exitEvent.is_set()):
+            currentWork = work[:]
             work = []  # Reset for next iteration
             originalPrint = getattr(builtins, "_original_print", None)
             if originalPrint is None:
@@ -328,23 +335,29 @@ class circuitOvermind:
                                 i % len(self.torFactory.circuits),
                                 timeout=timeout,
                                 customHeaders=customHeaders,
+                                exitEvent=None,
                             )
                         )
-
-                    for future in concurrent.futures.as_completed(futures):
-                        success, failedPayload = future.result()
-                        if not success and failedPayload:
-                            work.append(failedPayload)
+                for future in concurrent.futures.as_completed(futures):
+                    if exitEvent is not None and exitEvent.is_set():
+                        break
+                    success, failedPayload = future.result()
+                    if not success and failedPayload:
+                        work.append(failedPayload)
 
                 maxRetries -= 1
             except KeyboardInterrupt:
                 executor.shutdown(wait=False, cancel_futures=True)
-                raise
+                if exitEvent is not None:
+                    exitEvent.set()
 
         if work:
             print(f"Failed payloads after {maxRetries} retries: {len(work)}")
 
     def printCollectedOutput(self):
         print("------ Collected Results ------")
-        for outputs in self.collectedOutput:
-            print(outputs)
+        if self.collectedOutput != []:
+            for outputs in self.collectedOutput:
+                print(outputs)
+        else:
+            print("No Results Collected")
