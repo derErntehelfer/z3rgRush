@@ -263,6 +263,7 @@ class circuitOvermind:
         method="GET",
         postData=False,
         customHeaders=None,
+        exitEvent=None,
     ):
         work = list(payloads)
         maxRetries = 3  # Add retry limit
@@ -311,11 +312,17 @@ class circuitOvermind:
 
                     for future in concurrent.futures.as_completed(futures):
                         success, failedPayload = future.result()
+                        if exitEvent and exitEvent.is_set():
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+
                         if not success and failedPayload:
                             work.append(failedPayload)
                 maxRetries -= 1
             except KeyboardInterrupt:
-                print("\nCtrl+C received, shutting down Tor circuits...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
         if work:
             print(f"Failed payloads after {maxRetries} retries: {len(work)}")
 

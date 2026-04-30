@@ -3,11 +3,14 @@ import argparse
 import sys
 import os
 import json
+import threading
 from urllib.parse import urlparse
 
 from circuitOvermind import circuitOvermind
 from payloadFactory import payloadFactory
 from torCircuitFactory import torCircuitFactory
+
+exitEvent = threading.Event()
 
 
 def validateArguments(url, circuits, workers):
@@ -233,9 +236,11 @@ Examples:
             method=args.method,
             postData=args.post_data,
             customHeaders=customHeaders,
+            exitEvent=exitEvent,
         )
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down Tor circuits...")
+        exitEvent.set()
     except Exception as e:
         print(f"Aborting: {e}", file=sys.stderr)
     finally:
