@@ -236,6 +236,7 @@ Examples:
     except Exception as e:
         print(f"Aborting: {e}", file=sys.stderr)
     finally:
+        exitEvent.set()
         overmind.printCollectedOutput()
         torFactory.cleanupAll()
         print("Cleanup done, exiting.", file=sys.stderr)

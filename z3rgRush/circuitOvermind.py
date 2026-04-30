@@ -170,11 +170,15 @@ class circuitOvermind:
         ]
 
         requestKwargs = requestKwargs or {}
-
         if exitEvent is not None and exitEvent.is_set():
             return False, requestSpec
 
-        controller.signal(Signal.NEWNYM)
+        try:
+            controller.signal(Signal.NEWNYM)
+        except Exception as e:
+            if exitEvent is not None and exitEvent.is_set():
+                return False, requestSpec
+            raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
         time.sleep(0.5)
         codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
 
@@ -187,6 +191,8 @@ class circuitOvermind:
         data = requestSpec.get("data", None)
 
         if self.useProxyExit:
+            if exitEvent is not None and exitEvent.is_set():
+                return False, requestSpec
             availableProxies = [
                 p for p in self.upstreamProxies if p not in self.badProxies
             ]
@@ -291,11 +297,12 @@ class circuitOvermind:
         exitEvent=None,
     ):
         work = list(payloads)
-        maxRetries = 3  # Add retry limit
+        maxRetries = 3
 
         while work and maxRetries > 0 and (exitEvent is None or not exitEvent.is_set()):
             currentWork = work[:]
-            work = []  # Reset for next iteration
+            work = []
+
             originalPrint = getattr(builtins, "_original_print", None)
             if originalPrint is None:
                 builtins._original_print = builtins.print
@@ -304,54 +311,67 @@ class circuitOvermind:
                     if "Python 3" in " ".join(map(str, args))
                     else builtins._original_print(*args, **kwargs)
                 )
-            try:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=workers
-                ) as executor:
-                    futures = []
-                    for i, payload in enumerate(currentWork):
-                        if isinstance(payload, dict):
-                            requestSpec = payload
-                        elif postData and isinstance(payload, tuple):
-                            url, postDataValue = payload
-                            requestSpec = {
-                                "url": url,
-                                "data": postDataValue,
-                                "method": "POST",
-                                "payload": postDataValue,
-                            }
-                        else:
-                            requestSpec = {
-                                "url": payload,
-                                "data": None,
-                                "method": "GET",
-                                "payload": payload,
-                            }
 
-                        futures.append(
-                            executor.submit(
-                                self.fetchWithCircuit,
-                                requestSpec,
-                                i % len(self.torFactory.circuits),
-                                timeout=timeout,
-                                customHeaders=customHeaders,
-                                exitEvent=None,
-                            )
+            executor = None
+            futures = []
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+
+                for i, payload in enumerate(currentWork):
+                    if isinstance(payload, dict):
+                        requestSpec = payload
+                    elif postData and isinstance(payload, tuple):
+                        url, postDataValue = payload
+                        requestSpec = {
+                            "url": url,
+                            "data": postDataValue,
+                            "method": "POST",
+                            "payload": postDataValue,
+                        }
+                    else:
+                        requestSpec = {
+                            "url": payload,
+                            "data": None,
+                            "method": "GET",
+                            "payload": payload,
+                        }
+
+                    futures.append(
+                        executor.submit(
+                            self.fetchWithCircuit,
+                            requestSpec,
+                            i % len(self.torFactory.circuits),
+                            timeout=timeout,
+                            customHeaders=customHeaders,
+                            exitEvent=exitEvent,
                         )
+                    )
+
                 for future in concurrent.futures.as_completed(futures):
                     if exitEvent is not None and exitEvent.is_set():
                         break
                     success, failedPayload = future.result()
-                    if not success and failedPayload:
+                    if (
+                        not success
+                        and failedPayload
+                        and (exitEvent is None or not exitEvent.is_set())
+                    ):
                         work.append(failedPayload)
 
                 maxRetries -= 1
+
             except KeyboardInterrupt:
-                executor.shutdown(wait=False, cancel_futures=True)
                 if exitEvent is not None:
                     exitEvent.set()
+            except Exception as e:
+                print(f"sendPayloads failed: {e}")
+                if exitEvent is not None:
+                    exitEvent.set()
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
-        if work:
+        if work and (exitEvent is None or not exitEvent.is_set()):
             print(f"Failed payloads after {maxRetries} retries: {len(work)}")
 
     def printCollectedOutput(self):
