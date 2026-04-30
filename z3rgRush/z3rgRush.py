@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import threading
+import time
 from urllib.parse import urlparse
 
 from circuitOvermind import circuitOvermind
@@ -240,6 +241,9 @@ Examples:
         overmind.printCollectedOutput()
         torFactory.cleanupAll()
         print("Cleanup done, exiting.", file=sys.stderr)
+
+        time.sleep(1)
+        os._exit(0)
 
 
 if __name__ == "__main__":
