@@ -148,6 +148,7 @@ Examples:
     parser.add_argument(
         "--post-data",
         action="store_true",
+        default=None,
         help="Use wordlist entries as POST data instead of URL fuzzing",
     )
     parser.add_argument(
@@ -207,7 +208,8 @@ Examples:
         numberOfCircuits=args.circuits,
         verbose=args.verbose,
     )
-    _payloadFactory = payloadFactory()
+    payloadFactoryInstance = payloadFactory()
+    filetypes = payloadFactoryInstance.loadFiletypes(args.filetype)
     overmind = circuitOvermind(
         torFactory,
         headersInfo=headersInfo,
@@ -217,15 +219,15 @@ Examples:
     )
 
     try:
-        payloads = _payloadFactory.generatePayloads(
+        payloadGenerator = payloadFactoryInstance.iteratePayloads(
             args.target,
             args.wordlist,
-            filetypeArg=args.filetype,
-            postData=args.post_data,
+            filetypes,
+            args.post_data,
         )
 
         overmind.sendPayloads(
-            payloads,
+            payloadGenerator,
             workers=args.workers,
             timeout=args.timeout,
             method=args.method,
