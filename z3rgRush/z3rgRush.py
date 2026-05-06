@@ -5,6 +5,9 @@ import os
 import json
 import threading
 import time
+import subprocess
+import signal
+import atexit
 from urllib.parse import urlparse
 
 from circuitOvermind import circuitOvermind
@@ -174,6 +177,13 @@ Examples:
 
     args = parser.parse_args()
     args.workers = validateArguments(args.target, args.circuits, args.workers)
+
+    def handleSigint(signum, frame):
+        exitEvent.set()
+
+    signal.signal(signal.SIGINT, handleSigint)
+    subprocess.run(["stty", "-echoctl"], check=False)
+    atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
 
     # Parse custom headers
     customHeaders = {}
