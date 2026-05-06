@@ -3,6 +3,10 @@ import sys
 
 
 class payloadFactory:
+    def __init__(self, wordlist, recursion):
+        self.wordlist = wordlist
+        self.recursion = recursion
+
     def loadFiletypes(self, filetypeArg):
         if not filetypeArg:
             return [""]
@@ -19,9 +23,10 @@ class payloadFactory:
                 sys.exit(1)
         return [filetypeArg]
 
-    def iteratePayloads(self, target, wordlistPath, filetypes=None, postData=False):
+    def iteratePayloads(self, target, filetypes=None, postData=False):
         filetypes = filetypes or [""]
-        with open(wordlistPath, "r", encoding="utf-8", errors="replace") as f:
+
+        with open(self.wordlist, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 path = line.strip()
                 if not path:
@@ -47,6 +52,6 @@ class payloadFactory:
                             "payload": requestUrl,
                         }
 
-    def generatePayloads(self, target, wordlistPath, filetypeArg=None, postData=False):
+    def generatePayloads(self, target, filetypeArg=None, postData=False):
         filetypes = self.loadFiletypes(filetypeArg)
-        return list(self.iteratePayloads(target, wordlistPath, filetypes, postData))
+        return list(self.iteratePayloads(target, self.wordlist, filetypes, postData))

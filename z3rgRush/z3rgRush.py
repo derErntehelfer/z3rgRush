@@ -94,7 +94,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        # TODO Format this better
         epilog="""
 Examples:
     z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
@@ -174,6 +173,35 @@ Examples:
         default=False,
         help="Use additonal Exit proxies to hide Tor Exit Nodes (experimental)",
     )
+    parser.add_argument(
+        "-r",
+        "--recursion",
+        type=int,
+        default=0,
+    )
+
+    def handleRecursion():
+        nonlocal roundsOfRecursion
+        roundsOfRecursion += 1
+        print(
+            f"z3rgRush: Entering Recursive Fuzzing, current depth: {roundsOfRecursion}"
+        )
+        args.recursion = args.recursion - 1
+
+        for url in newTargets:
+            recursionPayloads = payloadFactoryInstance.iteratePayloads(
+                url,
+                filetypes,
+                args.post_data,
+            )
+            overmind.sendPayloads(
+                recursionPayloads,
+                workers=args.workers,
+                timeout=args.timeout,
+                postData=args.post_data,
+                customHeaders=customHeaders,
+                exitEvent=exitEvent,
+            )
 
     args = parser.parse_args()
     args.workers = validateArguments(args.target, args.circuits, args.workers)
@@ -208,13 +236,13 @@ Examples:
     ]
 
     print("\n".join(art))
-
+    roundsOfRecursion = 0
     headersInfo = parseHeadersArg(args.headers)
     torFactory = torCircuitFactory(
         numberOfCircuits=args.circuits,
         verbose=args.verbose,
     )
-    payloadFactoryInstance = payloadFactory()
+    payloadFactoryInstance = payloadFactory(args.wordlist, args.recursion)
     filetypes = payloadFactoryInstance.loadFiletypes(args.filetype)
     overmind = circuitOvermind(
         torFactory,
@@ -222,12 +250,13 @@ Examples:
         verbose=args.verbose,
         returnCodes=[int(code.replace(",", "").strip()) for code in args.return_codes],
         proxySet=args.use_exit_proxy,
+        payloadFactoryInstance=payloadFactoryInstance,
+        recursion=args.recursion,
     )
 
     try:
         payloadGenerator = payloadFactoryInstance.iteratePayloads(
             args.target,
-            args.wordlist,
             filetypes,
             args.post_data,
         )
@@ -240,6 +269,16 @@ Examples:
             customHeaders=customHeaders,
             exitEvent=exitEvent,
         )
+
+        newTargets = overmind.getHitsForRecursion()
+
+        if args.recursion >= 1 and newTargets != []:
+            handleRecursion()
+            overmind.cleanUrlListInRecursion()
+        elif args.recursion >= 1 and newTargets == []:
+            print(
+                "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
+            )
 
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down Tor circuits...")

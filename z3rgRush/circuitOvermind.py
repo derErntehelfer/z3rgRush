@@ -24,6 +24,8 @@ class circuitOvermind:
         verbose=False,
         returnCodes=200,
         proxySet=False,
+        payloadFactoryInstance=None,
+        recursion=0,
     ):
         self.torFactory = torFactory
         self.sessions = {}
@@ -37,6 +39,8 @@ class circuitOvermind:
         self.verbose = verbose
         self.collectedOutput = []
         self.useProxyExit = proxySet
+        self.hitsFromReturnCode = []
+        self.recursion = recursion
 
         if self.useProxyExit:
             self.upstreamProxies = self.collectProxyscrapeProxies()
@@ -269,6 +273,8 @@ class circuitOvermind:
                 return (False, requestSpec)
             if response.status_code in self.returnCodes:
                 self.collectedOutput.append(resultToCollect)
+                if self.recursion >= 1:
+                    self.hitsFromReturnCode.append((url + "/" + "{SWARM}"))
 
             return (True, None)
 
@@ -396,6 +402,12 @@ class circuitOvermind:
 
         if work and (exitEvent is None or not exitEvent.is_set()):
             print(f"Failed payloads after {maxRetries} retries: {len(work)}")
+
+    def getHitsForRecursion(self):
+        return self.hitsFromReturnCode
+
+    def cleanUrlListInRecursion(self):
+        self.hitsFromReturnCode.clear()
 
     def printCollectedOutput(self):
         print("------ Collected Results ------")
