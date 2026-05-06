@@ -17,6 +17,11 @@ from torCircuitFactory import torCircuitFactory
 exitEvent = threading.Event()
 
 
+def suppressTerminalOutput():
+    subprocess.run(["stty", "-echoctl"], check=False)
+    atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
+
+
 def validateArguments(url, circuits, workers):
     parsed = urlparse(url)
     maxCircuits = 16
@@ -91,6 +96,7 @@ def parseHeadersArg(headersArg):
 
 
 def main():
+    # suppressTerminalOutput()
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -178,16 +184,10 @@ Examples:
         "--recursion",
         type=int,
         default=0,
+        help="Set Recursion on hits, Value sets Depth of Recursion",
     )
 
-    def handleRecursion():
-        nonlocal roundsOfRecursion
-        roundsOfRecursion += 1
-        print(
-            f"z3rgRush: Entering Recursive Fuzzing, current depth: {roundsOfRecursion}"
-        )
-        args.recursion = args.recursion - 1
-
+    def handleRecursion(round):
         for url in newTargets:
             recursionPayloads = payloadFactoryInstance.iteratePayloads(
                 url,
@@ -210,8 +210,6 @@ Examples:
         exitEvent.set()
 
     signal.signal(signal.SIGINT, handleSigint)
-    subprocess.run(["stty", "-echoctl"], check=False)
-    atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
 
     # Parse custom headers
     customHeaders = {}
@@ -236,12 +234,21 @@ Examples:
     ]
 
     print("\n".join(art))
-    roundsOfRecursion = 0
     headersInfo = parseHeadersArg(args.headers)
-    torFactory = torCircuitFactory(
-        numberOfCircuits=args.circuits,
-        verbose=args.verbose,
-    )
+    try:
+        torFactory = torCircuitFactory(
+            numberOfCircuits=args.circuits,
+            verbose=args.verbose,
+        )
+    except OSError as osError:
+        print(f"z3rgRush: Could not build Circuits: {osError}")
+        exitEvent.set()
+        sys.exit(1)
+    except RuntimeError as runError:
+        print(f"z3rgRush: Could not build Circuits: {runError}")
+        exitEvent.set()
+        sys.exit(1)
+
     payloadFactoryInstance = payloadFactory(args.wordlist, args.recursion)
     filetypes = payloadFactoryInstance.loadFiletypes(args.filetype)
     overmind = circuitOvermind(
@@ -270,15 +277,18 @@ Examples:
             exitEvent=exitEvent,
         )
 
-        newTargets = overmind.getHitsForRecursion()
+        for round in range(0, args.recursion):
+            print(f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}")
+            newTargets = overmind.getHitsForRecursion()
 
-        if args.recursion >= 1 and newTargets != []:
-            handleRecursion()
-            overmind.cleanUrlListInRecursion()
-        elif args.recursion >= 1 and newTargets == []:
-            print(
-                "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
-            )
+            if newTargets != []:
+                handleRecursion(round)
+                overmind.cleanUrlListInRecursion()
+            elif newTargets == []:
+                print(
+                    "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
+                )
+                break
 
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down Tor circuits...")
