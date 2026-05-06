@@ -240,6 +240,7 @@ Examples:
             customHeaders=customHeaders,
             exitEvent=exitEvent,
         )
+
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down Tor circuits...")
         exitEvent.set()
