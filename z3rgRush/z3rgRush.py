@@ -278,10 +278,11 @@ Examples:
         )
 
         for round in range(0, args.recursion):
-            print(f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}")
             newTargets = overmind.getHitsForRecursion()
-
             if newTargets != []:
+                print(
+                    f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}"
+                )
                 handleRecursion(round)
                 overmind.cleanUrlListInRecursion()
             elif newTargets == []:
