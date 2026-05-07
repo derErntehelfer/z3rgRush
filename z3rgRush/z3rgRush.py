@@ -276,20 +276,20 @@ Examples:
             customHeaders=customHeaders,
             exitEvent=exitEvent,
         )
-
-        for round in range(0, args.recursion):
-            newTargets = overmind.getHitsForRecursion()
-            if newTargets != []:
-                print(
-                    f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}"
-                )
-                handleRecursion(round)
-                overmind.cleanUrlListInRecursion()
-            elif newTargets == []:
-                print(
-                    "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
-                )
-                break
+        if exitEvent is not None:
+            for round in range(0, args.recursion):
+                newTargets = overmind.getHitsForRecursion()
+                if newTargets != []:
+                    print(
+                        f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}"
+                    )
+                    handleRecursion(round)
+                    overmind.cleanUrlListInRecursion()
+                elif newTargets == []:
+                    print(
+                        "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
+                    )
+                    break
 
     except KeyboardInterrupt:
         print("\nCtrl+C received, shutting down Tor circuits...")
