@@ -76,7 +76,7 @@ Verbose mode also prints the active header set and routing chain.
 - When `--post-data` is enabled, payloads are sent as POST bodies instead of substituted into the URL.
 - If `--circuits` is not paired with `--workers`, worker count defaults to the circuit count.
 - The tool limits circuits to a maximum of 16.
-- Exit-proxy mode is experimental.
+- Exit-proxy mode is experimental, currently Requests may come out malformed after the proxy chain. Retry logic tries to collect these and resend them, but the kinks are still being worked out
 
 ## Author
 
