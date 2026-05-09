@@ -197,6 +197,9 @@ class circuitOvermind:
         url = requestSpec.get("url")
         method = requestSpec.get("method", "GET")
         data = requestSpec.get("data", None)
+        if exitEvent and exitEvent.is_set():
+            return False, requestSpec
+        socks.DEBUG = lambda msg: print(f"SOCKS DEBUG: {msg}") if self.verbose else None
 
         if self.useProxyExit:
             if exitEvent is not None and exitEvent.is_set():

@@ -15,6 +15,7 @@ from payloadFactory import payloadFactory
 from torCircuitFactory import torCircuitFactory
 
 exitEvent = threading.Event()
+interruptEvent = threading.Event()
 
 
 def suppressTerminalOutput():
@@ -207,6 +208,7 @@ Examples:
     args.workers = validateArguments(args.target, args.circuits, args.workers)
 
     def handleSigint(signum, frame):
+        interruptEvent.set()
         exitEvent.set()
 
     signal.signal(signal.SIGINT, handleSigint)
@@ -279,7 +281,10 @@ Examples:
         if exitEvent is not None:
             for round in range(0, args.recursion):
                 newTargets = overmind.getHitsForRecursion()
-                if newTargets != []:
+                if interruptEvent.is_set():
+                    print("Interrupted: Skipping recursion.", file=sys.stderr)
+                    break
+                elif newTargets != []:
                     print(
                         f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}"
                     )
