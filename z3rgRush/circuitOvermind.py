@@ -269,15 +269,18 @@ class circuitOvermind:
             print(resultToCollect)
             self.printHeadersVerbose(headers)
 
+            if response.status_code in self.returnCodes:
+                self.collectedOutput.append(resultToCollect)
+                if self.recursion >= 1:
+                    self.hitsFromReturnCode.append((url + "/" + "{SWARM} "))
+                return (True, None)
+
+            # 2. Check if it's a retryable error (only if it wasn't explicitly requested as a hit)
             if response.status_code in codesForRetry and not exitEvent.is_set():
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Response Status"
                 )
                 return (False, requestSpec)
-            if response.status_code in self.returnCodes:
-                self.collectedOutput.append(resultToCollect)
-                if self.recursion >= 1:
-                    self.hitsFromReturnCode.append((url + "/" + "{SWARM}"))
 
             return (True, None)
 
