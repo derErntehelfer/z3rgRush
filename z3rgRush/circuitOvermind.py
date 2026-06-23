@@ -4,6 +4,7 @@ import socket
 import time
 import builtins
 import subprocess
+import threading
 import requests
 import pyChainedProxy as socks
 from stem import Signal
@@ -22,7 +23,7 @@ class circuitOvermind:
         torFactory,
         headersInfo=None,
         verbose=False,
-        returnCodes=200,
+        returnCodes=[200],
         proxySet=False,
         payloadFactoryInstance=None,
         recursion=0,
@@ -41,6 +42,13 @@ class circuitOvermind:
         self.useProxyExit = proxySet
         self.hitsFromReturnCode = []
         self.recursion = recursion
+
+        self.circuitIps = {i: "Unknown" for i in range(len(self.torFactory.circuits))}
+        self.circuitLastStatus = {i: None for i in range(len(self.torFactory.circuits))}
+        self.circuitLock = threading.Lock()
+
+        # Status codes that indicate rate-limiting, WAF blocks, or connection issues
+        self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
 
         if self.useProxyExit:
             self.upstreamProxies = self.collectProxyscrapeProxies()
@@ -149,19 +157,35 @@ class circuitOvermind:
             print(f"    {key}: {value}")
 
     def getExitIp(self, proxies, timeout, headers):
-        try:
-            ipResponse = requests.get(
-                "http://httpbin.org/ip",
-                proxies=proxies,
-                timeout=timeout,
-                headers=headers,
-            )
-            exitIp = ipResponse.json().get("origin", "unknown")
-            if "," in exitIp:
-                exitIp.split(",")[0].strip()
-        except Exception as ip_error:
-            exitIp = f"IP fetch error: {ip_error}"
-        return exitIp
+        # List of fallback endpoints to get the exit IP
+        endpoints = [
+            ("https://api.ipify.org?format=json", lambda r: r.json().get("ip")),
+            ("https://httpbin.org/ip", lambda r: r.json().get("origin")),
+            ("https://ifconfig.me/ip", lambda r: r.text.strip()),
+        ]
+
+        for url, parser in endpoints:
+            try:
+                ipResponse = requests.get(
+                    url,
+                    proxies=proxies,
+                    timeout=timeout,
+                    headers=headers,
+                )
+                ipResponse.raise_for_status()
+                exitIp = parser(ipResponse)
+
+                # Handle cases where multiple IPs are returned (comma-separated)
+                if exitIp and "," in exitIp:
+                    exitIp = exitIp.split(",")[0].strip()
+
+                if exitIp:
+                    return exitIp
+            except Exception:
+                # If this endpoint fails (timeout, block, etc.), try the next one
+                continue
+
+        return "IP fetch error: All endpoints failed"
 
     def fetchWithCircuit(
         self,
@@ -181,6 +205,10 @@ class circuitOvermind:
         if exitEvent is not None and exitEvent.is_set():
             return False, requestSpec
 
+        headers = self.getNextHeaders()
+        if customHeaders:
+            headers.update(customHeaders)
+
         try:
             controller.signal(Signal.NEWNYM)
         except Exception as e:
@@ -189,10 +217,6 @@ class circuitOvermind:
             raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
         time.sleep(0.5)
         codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
-
-        headers = self.getNextHeaders()
-        if customHeaders:
-            headers.update(customHeaders)
 
         url = requestSpec.get("url")
         method = requestSpec.get("method", "GET")
