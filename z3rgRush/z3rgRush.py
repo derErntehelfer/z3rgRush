@@ -97,6 +97,8 @@ def parseHeadersArg(headersArg):
 
 
 def main():
+    torFactory = None
+    overmind = None
     # suppressTerminalOutput()
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
@@ -242,6 +244,9 @@ Examples:
             numberOfCircuits=args.circuits,
             verbose=args.verbose,
         )
+    except KeyboardInterrupt:
+        print("\nInterrupted during circuit building. Exiting...")
+        sys.exit(0)  # Clean exit, no traceback
     except OSError as osError:
         print(f"z3rgRush: Could not build Circuits: {osError}")
         exitEvent.set()
@@ -303,10 +308,11 @@ Examples:
         print(f"Aborting: {e}", file=sys.stderr)
     finally:
         exitEvent.set()
-        overmind.printCollectedOutput()
-        torFactory.cleanupAll()
+        if overmind is not None:
+            overmind.printCollectedOutput()
+        if torFactory is not None:
+            torFactory.cleanupAll()
         print("Cleanup done, exiting.", file=sys.stderr)
-
         time.sleep(1)
         os._exit(0)
 

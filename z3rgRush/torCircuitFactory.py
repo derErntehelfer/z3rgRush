@@ -49,7 +49,10 @@ class torCircuitFactory:
         }
 
         try:
-            torProcess = launch_tor_with_config(config=torConfig, timeout=30)
+            # take_ownership=True ensures Tor dies if Python crashes or is force-killed
+            torProcess = launch_tor_with_config(
+                config=torConfig, timeout=30, take_ownership=True
+            )
             print(f"Circuit {currentCircuitNr}: Tor Process launched")
 
             controller = Controller.from_port(port=controlPort)
@@ -82,14 +85,13 @@ class torCircuitFactory:
 
     def cleanupAll(self):
         for torProcess, controller, socksPort, dataDir in self.circuits:
-            with suppress(Exception):
-                controller.close()
             if torProcess is not None:
                 try:
-                    torProcess.wait(timeout=5)
+                    torProcess.terminate()  # Send SIGTERM for graceful exit
+                    torProcess.wait(timeout=2)
                 except Exception:
                     try:
-                        torProcess.kill()
+                        torProcess.kill()  # Force kill if it ignores SIGTERM
                         torProcess.wait(timeout=1)
                     except Exception:
                         pass

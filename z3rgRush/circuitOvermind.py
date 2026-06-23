@@ -378,17 +378,26 @@ class circuitOvermind:
                             exitEvent=exitEvent,
                         )
                     )
-
-                for future in concurrent.futures.as_completed(futures):
+                pending = set(futures)
+                while pending:
                     if exitEvent is not None and exitEvent.is_set():
                         break
-                    success, failedPayload = future.result()
-                    if (
-                        not success
-                        and failedPayload
-                        and (exitEvent is None or not exitEvent.is_set())
-                    ):
-                        work.append(failedPayload)
+
+                    # Wait up to 0.5 seconds for at least one future to complete
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=0.5,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+
+                    for future in done:
+                        success, failedPayload = future.result()
+                        if (
+                            not success
+                            and failedPayload
+                            and (exitEvent is None or not exitEvent.is_set())
+                        ):
+                            work.append(failedPayload)
 
                 maxRetries -= 1
 
