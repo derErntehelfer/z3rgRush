@@ -1,14 +1,25 @@
 import concurrent.futures
 import random
 import socket
+import sys
 import time
 import builtins
 import subprocess
 import threading
 import requests
-import pyChainedProxy as socks
 from stem import Signal
-from urllib.parse import urlparse
+# from urllib.parse import urlparse
+
+# Import based on Proxy or Tor Mode
+try:
+    import socks
+except ImportError:
+    try:
+        import pyChainedProxy as socks
+
+        sys.modules["socks"] = socks
+    except ImportError:
+        pass
 
 
 def quietPrint(*args, **kwargs):
@@ -30,7 +41,6 @@ class circuitOvermind:
     ):
         self.torFactory = torFactory
         self.sessions = {}
-
         for circuits in range(len(self.torFactory.circuits)):
             session = requests.Session()
             self.sessions[circuits] = session
@@ -55,9 +65,7 @@ class circuitOvermind:
             self.badProxies = set()
             print(f"Overmind: Collected {len(self.upstreamProxies)} upstream proxies")
 
-        socket.socket = socks.socksocket
-        socks.setproxy("localhost", socks.PROXY_TYPE_NONE)
-        socks.setproxy("127.0.0.1", socks.PROXY_TYPE_NONE)
+        # REMOVED: Global socket monkey-patching is now handled conditionally in fetchWithCircuit
 
         if headersInfo and headersInfo.get("config"):
             self.headerSets = headersInfo["config"]
@@ -118,16 +126,13 @@ class circuitOvermind:
         fetchIndex = (rotationIndex + 5) % 4
 
         headers = {
-            # Core rotation
             "User-Agent": self.headerSets["user_agents"][userAgentIndex],
             "Accept": self.headerSets["accept_headers"][acceptIndex],
             "Accept-Language": self.headerSets["accept_languages"][languageIndex],
             "Accept-Encoding": self.headerSets["accept_encodings"][encodingIndex],
             "Referer": self.headerSets["referers"][refererIndex],
-            # Always static
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            # Rotating Sec-Fetch
             "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][
                 fetchIndex % len(self.headerSets["sec_fetch_dest"])
             ],
@@ -138,7 +143,6 @@ class circuitOvermind:
                 fetchIndex % len(self.headerSets["sec_fetch_site"])
             ],
             "Sec-Fetch-User": "?1",
-            # Client Hints
             "Sec-CH-UA": '"Chromium";v="129", "Not=A?Brand";v="24", "Google Chrome";v="129"',
             "Sec-CH-UA-Mobile": self.headerSets["sec_ch_ua_mobile"][
                 userAgentIndex % len(self.headerSets["sec_ch_ua_mobile"])
@@ -157,7 +161,6 @@ class circuitOvermind:
             print(f"    {key}: {value}")
 
     def getExitIp(self, proxies, timeout, headers):
-        # List of fallback endpoints to get the exit IP
         endpoints = [
             ("https://api.ipify.org?format=json", lambda r: r.json().get("ip")),
             ("https://httpbin.org/ip", lambda r: r.json().get("origin")),
@@ -174,28 +177,24 @@ class circuitOvermind:
                 )
                 ipResponse.raise_for_status()
                 exitIp = parser(ipResponse)
-
-                # Handle cases where multiple IPs are returned (comma-separated)
                 if exitIp and "," in exitIp:
                     exitIp = exitIp.split(",")[0].strip()
-
                 if exitIp:
                     return exitIp
             except Exception:
-                # If this endpoint fails (timeout, block, etc.), try the next one
                 continue
-
-        return "IP fetch error: All endpoints failed"
+        return "IP fetch error"
 
     def rotateCircuit(self, circuitIndex):
+        """Rotate the Tor circuit for the given circuit index"""
         torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
             circuitIndex
         ]
         try:
             controller.signal(Signal.NEWNYM)
-            time.sleep(0.5)  # Allow time for new circuit to establish
+            time.sleep(1.5)  # Wait longer for circuit to establish
             if self.verbose:
-                print(f"Overmind: Circuit {circuitIndex} rotated")
+                print(f"Overmind: Circuit {circuitIndex} rotated successfully")
         except Exception as e:
             raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
 
@@ -221,81 +220,98 @@ class circuitOvermind:
         if customHeaders:
             headers.update(customHeaders)
 
-        # try:
-        #     controller.signal(Signal.NEWNYM)
-        # except Exception as e:
-        #     if exitEvent is not None and exitEvent.is_set():
-        #         return False, requestSpec
-        #     raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
-        # time.sleep(0.5)
-        codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
-
         url = requestSpec.get("url")
         method = requestSpec.get("method", "GET")
         data = requestSpec.get("data", None)
+
         if exitEvent and exitEvent.is_set():
             return False, requestSpec
-        socks.DEBUG = lambda msg: print(f"SOCKS DEBUG: {msg}") if self.verbose else None
 
-        if self.useProxyExit:
-            if exitEvent is not None and exitEvent.is_set():
-                return False, requestSpec
-
-            availableProxies = [
-                p for p in self.upstreamProxies if p not in self.badProxies
-            ]
-            if not availableProxies:
-                print("Overmind: All upstream proxies failed - refetching...")
-                self.upstreamProxies = self.collectProxyscrapeProxies()
-                self.badProxies.clear()
-                availableProxies = self.upstreamProxies
-            upstreamProxy = random.choice(availableProxies)
-
-            parsed = urlparse(upstreamProxy)
-            if parsed.scheme and parsed.hostname and parsed.port:
-                host = parsed.hostname
-                port = parsed.port
-            else:
-                # Fallback: ip:port
-                host, port_str = upstreamProxy.rsplit(":", 1)
-                port = int(port_str)
-                host = host.strip()[5:] if host.startswith("http") else host.strip()
-
-            chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
-
-        else:
-            chain = [f"socks5://127.0.0.1:{socksPort}/"]
-
-        socks.setdefaultproxy()  # Clear previous chain
-        for hop in chain:
-            socks.adddefaultproxy(*socks.parseproxy(hop))
-
-        if self.useProxyExit and "upstreamProxy" in locals():
-            exitIp = f"Tor+Proxy({upstreamProxy.split('://')[1] if '://' in upstreamProxy else upstreamProxy})"
-            proxyChain = {"http": upstreamProxy, "https": upstreamProxy}
-        else:
-            exitIp = self.getExitIp({}, timeout, headers)
-            proxyChain = {}
+        upstreamProxy = None
+        exitIp = "Unknown"
 
         try:
-            session = self.sessions[circuitIndex]
-            response = session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                timeout=timeout,
-                data=data,
-                **requestKwargs,
-            )
+            if self.useProxyExit:
+                # ==========================================
+                # EXIT PROXY PATH (Experimental)
+                # Uses monkey-patching, protected by a Lock
+                # ==========================================
+                availableProxies = [
+                    p for p in self.upstreamProxies if p not in self.badProxies
+                ]
+                if not availableProxies:
+                    print("Overmind: All upstream proxies failed - refetching...")
+                    self.upstreamProxies = self.collectProxyscrapeProxies()
+                    self.badProxies.clear()
+                    availableProxies = self.upstreamProxies
 
-            if self.verbose and self.useProxyExit:
-                print(
-                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {url}"
+                upstreamProxy = random.choice(availableProxies)
+                proxyDisplay = (
+                    upstreamProxy.split("://")[1]
+                    if "://" in upstreamProxy
+                    else upstreamProxy
                 )
-            elif self.verbose:
-                print(
-                    f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {url}"
+                exitIp = f"Tor+Proxy({proxyDisplay})"
+
+                import pyChainedProxy as chained_socks
+
+                # Lock prevents threads from overwriting each other's proxy chains
+                with self.circuitLock:
+                    chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
+                    chained_socks.setdefaultproxy()
+                    for hop in chain:
+                        chained_socks.adddefaultproxy(*chained_socks.parseproxy(hop))
+
+                    original_socket = socket.socket
+                    socket.socket = chained_socks.socksocket
+
+                    try:
+                        session = self.sessions[circuitIndex]
+                        response = session.request(
+                            method=method,
+                            url=url,
+                            headers=headers,
+                            timeout=timeout,
+                            data=data,
+                            **requestKwargs,
+                        )
+                    finally:
+                        socket.socket = original_socket  # Restore immediately
+
+            else:
+                # ==========================================
+                # NATIVE PATH (Standard, Thread-Safe)
+                # Uses native requests proxy support
+                # ==========================================
+                # socks5h:// forces DNS resolution over Tor (prevents DNS leaks)
+                proxies = {
+                    "http": f"socks5h://127.0.0.1:{socksPort}",
+                    "https": f"socks5h://127.0.0.1:{socksPort}",
+                }
+
+                exitIp = self.getExitIp(proxies, timeout, headers)
+
+                session = self.sessions[circuitIndex]
+                response = session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    timeout=timeout,
+                    data=data,
+                    proxies=proxies,
+                    **requestKwargs,
                 )
+
+            # --- LOGGING ---
+            if self.verbose:
+                if self.useProxyExit and upstreamProxy:
+                    print(
+                        f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {url}"
+                    )
+                else:
+                    print(
+                        f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {url}"
+                    )
 
             resultToCollect = (
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
@@ -305,13 +321,14 @@ class circuitOvermind:
             print(resultToCollect)
             self.printHeadersVerbose(headers)
 
+            # --- SUCCESS / RECURSION ---
             if response.status_code in self.returnCodes:
                 self.collectedOutput.append(resultToCollect)
                 if self.recursion >= 1:
                     self.hitsFromReturnCode.append((url + "/" + "{SWARM}"))
                 return (True, None)
 
-            # Check if it's a rate-limiting or WAF block - rotate circuit and retry
+            # --- RATE LIMIT / WAF DETECTION ---
             if response.status_code in self.codesForRotation and not exitEvent.is_set():
                 print(
                     f"Overmind: Rate limit/WAF detected (status {response.status_code}) on circuit {circuitIndex} - rotating circuit"
@@ -324,47 +341,42 @@ class circuitOvermind:
 
             return (True, None)
 
+        # --- ERROR HANDLING ---
         except requests.exceptions.Timeout:
             if not exitEvent.is_set():
-                if self.useProxyExit:
+                if self.useProxyExit and upstreamProxy:
                     self.badProxies.add(upstreamProxy)
                     print(
-                        f"Overmind: Payload {url} returned to Work Container - [BAD PROXY] {upstreamProxy} timed out - blacklisted"
+                        f"Overmind: [BAD PROXY] {upstreamProxy} timed out - blacklisted"
                     )
-                else:
-                    print(
-                        f"Overmind: Payload {url} returned to Work Container - Timed out"
-                    )
-                    # Rotate circuit on timeout as well
-                    self.rotateCircuit(circuitIndex)
+
+                print(f"Overmind: Payload {url} returned to Work Container - Timed out")
+                self.rotateCircuit(circuitIndex)
             return (False, requestSpec)
+
         except requests.exceptions.ConnectionError as ce:
             if "refused" in str(ce).lower() or "reset" in str(ce).lower():
                 if not exitEvent.is_set():
-                    if self.useProxyExit:
+                    if self.useProxyExit and upstreamProxy:
                         self.badProxies.add(upstreamProxy)
                         print(
-                            f"Overmind: Payload {url} returned to Work Container - [BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
+                            f"Overmind: [BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
                         )
-                    else:
-                        print(
-                            f"Overmind: Payload {url} returned to Work Container - Connection refused"
-                        )
-                        # Rotate circuit on connection errors
-                        self.rotateCircuit(circuitIndex)
 
+                    print(
+                        f"Overmind: Payload {url} returned to Work Container - Connection refused"
+                    )
+                    self.rotateCircuit(circuitIndex)
             return (False, requestSpec)
+
         except Exception as e:
             if not exitEvent.is_set():
                 print(
-                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
-                    f"IP={exitIp}, error -> {e} "
-                    f"(URL: {url})"
+                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): IP={exitIp}, error -> {e} (URL: {url})"
                 )
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Failed to Send"
                 )
-                # Rotate circuit on general errors
                 self.rotateCircuit(circuitIndex)
             return (False, requestSpec)
 
@@ -427,12 +439,12 @@ class circuitOvermind:
                             exitEvent=exitEvent,
                         )
                     )
+
                 pending = set(futures)
                 while pending:
                     if exitEvent is not None and exitEvent.is_set():
                         break
 
-                    # Wait up to 0.5 seconds for at least one future to complete
                     done, pending = concurrent.futures.wait(
                         pending,
                         timeout=0.5,
