@@ -187,6 +187,18 @@ class circuitOvermind:
 
         return "IP fetch error: All endpoints failed"
 
+    def rotateCircuit(self, circuitIndex):
+        torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+            circuitIndex
+        ]
+        try:
+            controller.signal(Signal.NEWNYM)
+            time.sleep(0.5)  # Allow time for new circuit to establish
+            if self.verbose:
+                print(f"Overmind: Circuit {circuitIndex} rotated")
+        except Exception as e:
+            raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
+
     def fetchWithCircuit(
         self,
         requestSpec,
@@ -209,13 +221,13 @@ class circuitOvermind:
         if customHeaders:
             headers.update(customHeaders)
 
-        try:
-            controller.signal(Signal.NEWNYM)
-        except Exception as e:
-            if exitEvent is not None and exitEvent.is_set():
-                return False, requestSpec
-            raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
-        time.sleep(0.5)
+        # try:
+        #     controller.signal(Signal.NEWNYM)
+        # except Exception as e:
+        #     if exitEvent is not None and exitEvent.is_set():
+        #         return False, requestSpec
+        #     raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
+        # time.sleep(0.5)
         codesForRetry = {429, 430, 440, 449, 503, 521, 523, 524}
 
         url = requestSpec.get("url")
@@ -296,13 +308,17 @@ class circuitOvermind:
             if response.status_code in self.returnCodes:
                 self.collectedOutput.append(resultToCollect)
                 if self.recursion >= 1:
-                    self.hitsFromReturnCode.append((url + "/" + "{SWARM} "))
+                    self.hitsFromReturnCode.append((url + "/" + "{SWARM}"))
                 return (True, None)
 
-            # 2. Check if it's a retryable error (only if it wasn't explicitly requested as a hit)
-            if response.status_code in codesForRetry and not exitEvent.is_set():
+            # Check if it's a rate-limiting or WAF block - rotate circuit and retry
+            if response.status_code in self.codesForRotation and not exitEvent.is_set():
                 print(
-                    f"Overmind: Payload {url} returned to Work Container - Response Status"
+                    f"Overmind: Rate limit/WAF detected (status {response.status_code}) on circuit {circuitIndex} - rotating circuit"
+                )
+                self.rotateCircuit(circuitIndex)
+                print(
+                    f"Overmind: Payload {url} returned to Work Container - Response Status {response.status_code}"
                 )
                 return (False, requestSpec)
 
@@ -319,6 +335,8 @@ class circuitOvermind:
                     print(
                         f"Overmind: Payload {url} returned to Work Container - Timed out"
                     )
+                    # Rotate circuit on timeout as well
+                    self.rotateCircuit(circuitIndex)
             return (False, requestSpec)
         except requests.exceptions.ConnectionError as ce:
             if "refused" in str(ce).lower() or "reset" in str(ce).lower():
@@ -332,6 +350,8 @@ class circuitOvermind:
                         print(
                             f"Overmind: Payload {url} returned to Work Container - Connection refused"
                         )
+                        # Rotate circuit on connection errors
+                        self.rotateCircuit(circuitIndex)
 
             return (False, requestSpec)
         except Exception as e:
@@ -344,6 +364,8 @@ class circuitOvermind:
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Failed to Send"
                 )
+                # Rotate circuit on general errors
+                self.rotateCircuit(circuitIndex)
             return (False, requestSpec)
 
     def sendPayloads(
