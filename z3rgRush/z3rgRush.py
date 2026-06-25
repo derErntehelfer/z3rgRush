@@ -172,7 +172,7 @@ Examples:
         "-rc",
         "--return-codes",
         nargs="*",
-        default=[200],
+        default=["200"],
         help="HTTP status codes considered successful (default: 200)",
     )
     parser.add_argument(
@@ -215,13 +215,6 @@ Examples:
 
     signal.signal(signal.SIGINT, handleSigint)
 
-    # Parse custom headers
-    customHeaders = {}
-    for h in args.headers:
-        if ":" in h:
-            key, value = h.split(":", 1)
-            customHeaders[key.strip()] = value.strip()
-
     art = [
         " ",
         "======================================================================",
@@ -238,7 +231,10 @@ Examples:
     ]
 
     print("\n".join(art))
+
+    # Parse headers
     headersInfo = parseHeadersArg(args.headers)
+    customHeaders = headersInfo.get("custom", {})
     try:
         torFactory = torCircuitFactory(
             numberOfCircuits=args.circuits,

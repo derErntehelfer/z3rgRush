@@ -185,7 +185,7 @@ class circuitOvermind:
                 continue
         return "IP fetch error"
 
-    def rotateCircuit(self, circuitIndex):
+    def rotateCircuit(self, circuitIndex, reason=None):
         """Rotate the Tor circuit for the given circuit index"""
         torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
             circuitIndex
@@ -193,8 +193,13 @@ class circuitOvermind:
         try:
             controller.signal(Signal.NEWNYM)
             time.sleep(1.5)  # Wait longer for circuit to establish
-            if self.verbose:
-                print(f"Overmind: Circuit {circuitIndex} rotated successfully")
+
+            # FIX: Always print if triggered by an error (reason provided), otherwise respect verbose flag
+            if reason or self.verbose:
+                reason_str = f" (Reason: {reason})" if reason else ""
+                print(
+                    f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
+                )
         except Exception as e:
             raise RuntimeError(f"Failed to rotate Tor circuit: {e}") from e
 
@@ -289,7 +294,13 @@ class circuitOvermind:
                     "https": f"socks5h://127.0.0.1:{socksPort}",
                 }
 
-                exitIp = self.getExitIp(proxies, timeout, headers)
+                # FIX: Only fetch the IP if it's not already cached for this circuit
+                if self.circuitIps[circuitIndex] == "Unknown":
+                    self.circuitIps[circuitIndex] = self.getExitIp(
+                        proxies, timeout, headers
+                    )
+
+                exitIp = self.circuitIps[circuitIndex]
 
                 session = self.sessions[circuitIndex]
                 response = session.request(
@@ -333,7 +344,9 @@ class circuitOvermind:
                 print(
                     f"Overmind: Rate limit/WAF detected (status {response.status_code}) on circuit {circuitIndex} - rotating circuit"
                 )
-                self.rotateCircuit(circuitIndex)
+                self.rotateCircuit(
+                    circuitIndex, reason=f"WAF/Rate Limit ({response.status_code})"
+                )
                 print(
                     f"Overmind: Payload {url} returned to Work Container - Response Status {response.status_code}"
                 )
@@ -351,7 +364,7 @@ class circuitOvermind:
                     )
 
                 print(f"Overmind: Payload {url} returned to Work Container - Timed out")
-                self.rotateCircuit(circuitIndex)
+                self.rotateCircuit(circuitIndex, reason="Timeout")
             return (False, requestSpec)
 
         except requests.exceptions.ConnectionError as ce:
@@ -366,18 +379,27 @@ class circuitOvermind:
                     print(
                         f"Overmind: Payload {url} returned to Work Container - Connection refused"
                     )
-                    self.rotateCircuit(circuitIndex)
+                    self.rotateCircuit(circuitIndex, reason="Connection Refused/Reset")
             return (False, requestSpec)
 
         except Exception as e:
             if not exitEvent.is_set():
+                # FIX: Blacklist the upstream proxy if it threw a generic/SOCKS error
+                if self.useProxyExit and upstreamProxy:
+                    self.badProxies.add(upstreamProxy)
+                    print(
+                        f"Overmind: [BAD PROXY] {upstreamProxy} threw error {e} - blacklisted"
+                    )
+
                 print(
-                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): IP={exitIp}, error -> {e} (URL: {url})"
+                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): IP={exitIp}, error -> {e} (URL: {url}) "
                 )
                 print(
-                    f"Overmind: Payload {url} returned to Work Container - Failed to Send"
+                    f"Overmind: Payload {url} returned to Work Container - Failed to Send "
                 )
-                self.rotateCircuit(circuitIndex)
+                self.rotateCircuit(
+                    circuitIndex, reason=f"Exception ({type(e).__name__})"
+                )
             return (False, requestSpec)
 
     def sendPayloads(
