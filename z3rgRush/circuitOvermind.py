@@ -56,6 +56,7 @@ class circuitOvermind:
         self.circuitIps = {i: "Unknown" for i in range(len(self.torFactory.circuits))}
         self.circuitLastStatus = {i: None for i in range(len(self.torFactory.circuits))}
         self.circuitLock = threading.Lock()
+        self.headerLock = threading.Lock()
 
         # Status codes that indicate rate-limiting, WAF blocks, or connection issues
         self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
@@ -115,8 +116,9 @@ class circuitOvermind:
             print(f"Proxy collection failed: {e}")
 
     def getNextHeaders(self):
-        self.headerIndex += 1
-        rotationIndex = self.headerIndex % 100
+        with self.headerLock:
+            self.headerIndex += 1
+            rotationIndex = self.headerIndex % 100
 
         userAgentIndex = rotationIndex % len(self.headerSets["user_agents"])
         acceptIndex = (rotationIndex + 1) % len(self.headerSets["accept_headers"])
