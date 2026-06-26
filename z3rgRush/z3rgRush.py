@@ -23,13 +23,20 @@ def suppressTerminalOutput():
     atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
 
 
-def validateArguments(url, circuits, workers):
+def validateArguments(url, circuits, workers, postData):
     parsed = urlparse(url)
     maxCircuits = 16
 
     if not parsed.scheme or parsed.scheme not in ("http", "https"):
         print(
             f"Error: URL must start with http:// or https:// ('{url}')",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # --- NEW VALIDATION ---
+    if not postData and "{SWARM}" not in url:
+        print(
+            f"Error: Target URL must contain '{{SWARM}}' placeholder for GET fuzzing (e.g., http://target.com/{{SWARM}})",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -207,7 +214,9 @@ Examples:
             )
 
     args = parser.parse_args()
-    args.workers = validateArguments(args.target, args.circuits, args.workers)
+    args.workers = validateArguments(
+        args.target, args.circuits, args.workers, args.post_data
+    )
 
     def handleSigint(signum, frame):
         interruptEvent.set()
