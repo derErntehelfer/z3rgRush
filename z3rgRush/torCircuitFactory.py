@@ -3,9 +3,15 @@ import socket
 import sys
 import tempfile
 import time
+import logging
 from contextlib import suppress
 from stem.control import Controller
 from stem.process import launch_tor_with_config
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.console import Console
+
+console = Console()
+logger = logging.getLogger("z3rgRush.torCircuitFactory")
 
 
 class torCircuitFactory:
@@ -14,18 +20,40 @@ class torCircuitFactory:
         self.circuits = []
         self.dataDirs = []
 
-        for currentCircuitNr in range(numberOfCircuits):
-            circuitBuildRetries = 3
-            self.generateCircuit(currentCircuitNr, circuitBuildRetries)
+        console.print(
+            f"\n[circuit]Initializing {numberOfCircuits} Tor circuits...[/circuit]"
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            for currentCircuitNr in range(numberOfCircuits):
+                task = progress.add_task(
+                    f"[circuit]Building circuit {currentCircuitNr + 1}/{numberOfCircuits}[/circuit]",
+                    total=None,
+                )
+
+                circuitBuildRetries = 3
+                self.generateCircuit(
+                    currentCircuitNr, circuitBuildRetries, progress, task
+                )
+
+        console.print(f"[success] All circuits initialized successfully[/success]\n")
 
     def findFreePort(self, host="127.0.0.1"):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind((host, 0))
             return sock.getsockname()[1]
 
-    def generateCircuit(self, currentCircuitNr, circuitBuildRetries):
+    def generateCircuit(
+        self, currentCircuitNr, circuitBuildRetries, progress=None, task=None
+    ):
         if circuitBuildRetries <= 0:
-            print("Circuit Factory: Max Retries reached. Raising error for cleanup.")
+            logger.error(
+                f"[error]Circuit {currentCircuitNr}: Max retries reached[/error]"
+            )
             raise RuntimeError("Failed to build all circuits after retries")
 
         circuitBuildRetries = circuitBuildRetries
@@ -34,8 +62,8 @@ class torCircuitFactory:
         dataDir = tempfile.mkdtemp()
         self.dataDirs.append(dataDir)
 
-        print(
-            f"Circuit {currentCircuitNr}: Ports collected, Temp Data Structures created"
+        logger.debug(
+            f"Circuit {currentCircuitNr}: Ports {socksPort}/{controlPort}, DataDir: {dataDir}"
         )
 
         torConfig = {
@@ -53,28 +81,43 @@ class torCircuitFactory:
             torProcess = launch_tor_with_config(
                 config=torConfig, timeout=30, take_ownership=True
             )
-            print(f"Circuit {currentCircuitNr}: Tor Process launched")
+            logger.debug(f"Circuit {currentCircuitNr}: Tor process launched")
 
             controller = Controller.from_port(port=controlPort)
             controller.authenticate()
-            print(
-                f"Circuit {currentCircuitNr}: Tor Process authenticated, waiting for bootstrap"
-            )
+
+            if progress and task:
+                progress.update(
+                    task,
+                    description=f"[circuit]Circuit {currentCircuitNr + 1}: Bootstrapping...[/circuit]",
+                )
+
             self.waitForBootstrap(controller, currentCircuitNr)
             self.circuits.append((torProcess, controller, socksPort, dataDir))
 
-        except Exception as e:
-            print(f"Error building circuit {currentCircuitNr}: {e}", file=sys.stderr)
-            self.cleanupSingle(dataDir)  # Targeted cleanup
-            print(
-                f"Circuit Factory: Retrying Circuit {currentCircuitNr} - {circuitBuildRetries - 1} retries left"
+            logger.info(
+                f"[success]Circuit {currentCircuitNr} ready (SOCKS: {socksPort})[/success]"
             )
-            self.generateCircuit(currentCircuitNr, circuitBuildRetries - 1)
+
+        except Exception as e:
+            logger.error(f"[error]Circuit {currentCircuitNr}: {e}[/error]")
+            self.cleanupSingle(dataDir)
+
+            if progress and task:
+                progress.update(
+                    task,
+                    description=f"[warning]Circuit {currentCircuitNr + 1}: Retrying...[/warning]",
+                )
+
+            self.generateCircuit(
+                currentCircuitNr, circuitBuildRetries - 1, progress, task
+            )
 
     def waitForBootstrap(self, controller, currentCircuitNr):
         while True:
             status = controller.get_info("status/bootstrap-phase")
-            print(f"Circuit {currentCircuitNr}: {status}")
+            logger.debug(f"Circuit {currentCircuitNr}: {status}")
+
             if "100" in status:
                 break
             time.sleep(1)

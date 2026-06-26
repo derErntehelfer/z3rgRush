@@ -6,9 +6,11 @@ import time
 import builtins
 import subprocess
 import threading
+
+# import logging
 import requests
 from stem import Signal
-# from urllib.parse import urlparse
+
 
 # Import based on Proxy or Tor Mode
 try:
