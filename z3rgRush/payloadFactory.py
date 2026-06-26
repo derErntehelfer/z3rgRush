@@ -1,11 +1,15 @@
 import os
 import sys
+import logging
+
+logger = logging.getLogger("z3rgRush.payloadFactory")
 
 
 class payloadFactory:
     def __init__(self, wordlist, recursion):
         self.wordlist = wordlist
         self.recursion = recursion
+        logger.debug(f"PayloadFactory initialized with wordlist: {wordlist}")
 
     def loadFiletypes(self, filetypeArg):
         if not filetypeArg:
@@ -15,12 +19,14 @@ class payloadFactory:
                 with open(filetypeArg, "r") as f:
                     extensions = [line.strip() for line in f if line.strip()]
                 if not extensions:
-                    print(f"Error: {filetypeArg} is empty.", file=sys.stderr)
+                    logger.error(f"[error]{filetypeArg} is empty[/error]")
                     sys.exit(1)
+                logger.debug(f"Loaded {len(extensions)} filetypes from {filetypeArg}")
                 return extensions
             except Exception as e:
-                print(f"Error reading {filetypeArg}: {e}", file=sys.stderr)
+                logger.error(f"[error]Error reading {filetypeArg}: {e}[/error]")
                 sys.exit(1)
+        logger.debug(f"Using single filetype: {filetypeArg}")
         return [filetypeArg]
 
     def iteratePayloads(self, target, filetypes=None, postData=False):
