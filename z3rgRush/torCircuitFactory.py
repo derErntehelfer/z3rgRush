@@ -8,9 +8,11 @@ from contextlib import suppress
 from stem.control import Controller
 from stem.process import launch_tor_with_config
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.console import Console
 
-console = Console()
+# CRITICAL FIX: Import the shared console from logger.py
+# This ensures RichHandler and Progress bar coordinate terminal output properly
+from logger import console
+
 logger = logging.getLogger("z3rgRush.torCircuitFactory")
 
 
@@ -20,18 +22,16 @@ class torCircuitFactory:
         self.circuits = []
         self.dataDirs = []
 
-        console.print(
-            f"\n[circuit]Initializing {numberOfCircuits} Tor circuits...[/circuit]"
-        )
+        console.print(f"\nInitializing {numberOfCircuits} Tor circuits...")
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            console=console,
+            console=console,  # Use the shared console
         ) as progress:
             for currentCircuitNr in range(numberOfCircuits):
                 task = progress.add_task(
-                    f"[circuit]Building circuit {currentCircuitNr + 1}/{numberOfCircuits}[/circuit]",
+                    f"Building circuit {currentCircuitNr + 1}/{numberOfCircuits}",
                     total=None,
                 )
 
@@ -40,7 +40,7 @@ class torCircuitFactory:
                     currentCircuitNr, circuitBuildRetries, progress, task
                 )
 
-        console.print(f"[success] All circuits initialized successfully[/success]\n")
+        console.print("All circuits initialized successfully\n")
 
     def findFreePort(self, host="127.0.0.1"):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -51,12 +51,9 @@ class torCircuitFactory:
         self, currentCircuitNr, circuitBuildRetries, progress=None, task=None
     ):
         if circuitBuildRetries <= 0:
-            logger.error(
-                f"[error]Circuit {currentCircuitNr}: Max retries reached[/error]"
-            )
+            logger.error(f"Circuit {currentCircuitNr}: Max retries reached")
             raise RuntimeError("Failed to build all circuits after retries")
 
-        circuitBuildRetries = circuitBuildRetries
         socksPort = self.findFreePort()
         controlPort = self.findFreePort()
         dataDir = tempfile.mkdtemp()
@@ -77,7 +74,6 @@ class torCircuitFactory:
         }
 
         try:
-            # take_ownership=True ensures Tor dies if Python crashes or is force-killed
             torProcess = launch_tor_with_config(
                 config=torConfig, timeout=30, take_ownership=True
             )
@@ -89,24 +85,30 @@ class torCircuitFactory:
             if progress and task:
                 progress.update(
                     task,
-                    description=f"[circuit]Circuit {currentCircuitNr + 1}: Bootstrapping...[/circuit]",
+                    description=f"Circuit {currentCircuitNr + 1}: Bootstrapping...",
                 )
 
             self.waitForBootstrap(controller, currentCircuitNr)
             self.circuits.append((torProcess, controller, socksPort, dataDir))
 
-            logger.info(
-                f"[success]Circuit {currentCircuitNr} ready (SOCKS: {socksPort})[/success]"
-            )
+            if progress and task:
+                # Update task to show it's ready before removing it
+                progress.update(
+                    task, description=f"Circuit {currentCircuitNr + 1}: Ready"
+                )
+                # CRITICAL FIX: Remove the task so the progress bar doesn't accumulate
+                progress.remove_task(task)
+
+            logger.info(f"Circuit {currentCircuitNr} ready (SOCKS: {socksPort})")
 
         except Exception as e:
-            logger.error(f"[error]Circuit {currentCircuitNr}: {e}[/error]")
+            logger.error(f"Circuit {currentCircuitNr}: {e}")
             self.cleanupSingle(dataDir)
 
             if progress and task:
                 progress.update(
                     task,
-                    description=f"[warning]Circuit {currentCircuitNr + 1}: Retrying...[/warning]",
+                    description=f"Circuit {currentCircuitNr + 1}: Retrying...",
                 )
 
             self.generateCircuit(
@@ -128,13 +130,19 @@ class torCircuitFactory:
 
     def cleanupAll(self):
         for torProcess, controller, socksPort, dataDir in self.circuits:
+            if controller:
+                try:
+                    controller.close()
+                except Exception:
+                    pass
+
             if torProcess is not None:
                 try:
-                    torProcess.terminate()  # Send SIGTERM for graceful exit
+                    torProcess.terminate()
                     torProcess.wait(timeout=2)
                 except Exception:
                     try:
-                        torProcess.kill()  # Force kill if it ignores SIGTERM
+                        torProcess.kill()
                         torProcess.wait(timeout=1)
                     except Exception:
                         pass

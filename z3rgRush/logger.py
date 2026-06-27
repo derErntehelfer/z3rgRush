@@ -1,62 +1,77 @@
 import logging
+import warnings
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.theme import Theme
 
-# Custom theme for z3rgRush
-z3rg_theme = Theme(
-    {
-        "info": "cyan",
-        "warning": "yellow",
-        "error": "bold red",
-        "success": "bold green",
-        "circuit": "magenta",
-        "payload": "blue",
-    }
-)
+# Single shared Console instance for the entire application
+console = Console()
 
-console = Console(theme=z3rg_theme)
+
+class StemLogFilter(logging.Filter):
+    """
+    stem sometimes internally sets its child loggers to DEBUG,
+    bypassing standard level configurations. This filter drops them.
+    """
+
+    def filter(self, record):
+        if record.name.startswith("stem") and record.levelno < logging.WARNING:
+            return False
+        return True
+
+
+class StemSocketErrorFilter(logging.Filter):
+    """Filter to suppress stem SocketClosed errors during shutdown."""
+
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Error while receiving a control message" in msg and "SocketClosed" in msg:
+            return False
+        return True
 
 
 def setup_logging(verbose=False, log_file=None):
-    """
-    Configure logging with rich handler
-
-    Args:
-        verbose: Enable debug level logging
-        log_file: Optional file path for log output
-    """
     log_level = logging.DEBUG if verbose else logging.INFO
 
-    # Configure root logger
+    rich_handler = RichHandler(
+        console=console,
+        rich_tracebacks=True,
+        tracebacks_show_locals=verbose,
+        markup=False,
+        show_time=False,
+        show_path=False,
+    )
+
+    # Add filters to suppress stem noise
+    rich_handler.addFilter(StemLogFilter())
+    rich_handler.addFilter(StemSocketErrorFilter())
+
     logging.basicConfig(
         level=log_level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[
-            RichHandler(
-                console=console,
-                rich_tracebacks=True,
-                tracebacks_show_locals=verbose,
-                markup=True,
-            )
-        ],
+        handlers=[rich_handler],
     )
 
-    # Add file handler if specified
     if log_file:
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
+        file_handler.addFilter(StemLogFilter())
+        file_handler.addFilter(StemSocketErrorFilter())
         logging.getLogger().addHandler(file_handler)
 
-    # Suppress noisy loggers
+    # Suppress other noisy loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("stem").setLevel(logging.WARNING)
+
+    # Force stem to propagate so our filters can catch it
+    stem_logger = logging.getLogger("stem")
+    stem_logger.handlers.clear()
+    stem_logger.propagate = True
+
+    warnings.filterwarnings("ignore")
 
     return logging.getLogger("z3rgRush")
 
 
-# Global logger instance
 logger = setup_logging()

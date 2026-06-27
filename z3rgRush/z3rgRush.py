@@ -8,7 +8,13 @@ import time
 import subprocess
 import signal
 import atexit
+import logging
 from urllib.parse import urlparse
+
+# Import logger and console first
+from logger import setup_logging, console
+
+logger = logging.getLogger("z3rgRush.main")
 
 from circuitOvermind import circuitOvermind
 from payloadFactory import payloadFactory
@@ -26,95 +32,76 @@ def suppressTerminalOutput():
 def validateArguments(url, circuits, workers, postData):
     parsed = urlparse(url)
     maxCircuits = 16
-
     if not parsed.scheme or parsed.scheme not in ("http", "https"):
-        print(
-            f"Error: URL must start with http:// or https:// ('{url}')",
-            file=sys.stderr,
-        )
+        logger.error(f"URL must start with http:// or https:// ('{url}')")
         sys.exit(1)
-    # --- NEW VALIDATION ---
+
     if not postData and "{SWARM}" not in url:
-        print(
-            f"Error: Target URL must contain '{{SWARM}}' placeholder for GET fuzzing (e.g., http://target.com/{{SWARM}})",
-            file=sys.stderr,
+        logger.error(
+            "Target URL must contain '{{SWARM}}' placeholder for GET fuzzing (e.g., http://target.com/{{SWARM}})"
         )
         sys.exit(1)
 
     if circuits < 1 or circuits > maxCircuits:
-        print(
-            f"Error: --circuits must be between 1 and {maxCircuits}",
-            file=sys.stderr,
-        )
+        logger.error(f"--circuits must be between 1 and {maxCircuits}")
         sys.exit(1)
 
     if workers is None:
         return min(16, circuits)
-
     if workers > circuits:
-        print(
-            f"Warning: limiting workers to {circuits} (same as circuits).",
-            file=sys.stderr,
-        )
+        logger.warning(f"Limiting workers to {circuits} (same as circuits).")
         return circuits
     return workers
 
 
 def parseHeadersArg(headersArg):
     if not headersArg:
-        # Default: use headers.json if it exists
         default_file = "headersForRotation.json"
         if os.path.exists(default_file):
-            print(f"z3rgRush: Using default headers file: {default_file}")
+            logger.info(f"Using default headers file: {default_file}")
             with open(default_file, "r") as f:
                 return {"file": default_file, "config": json.load(f)}
         else:
-            print("z3rgRush: No headers.json found, using empty header rotation")
+            logger.info("No headers.json found, using empty header rotation")
             return {"file": None, "config": {}}
 
-    # Single argument - check if it's a JSON file
     if (
         len(headersArg) == 1
         and os.path.exists(headersArg[0])
         and headersArg[0].endswith(".json")
     ):
         headersFile = headersArg[0]
-        print(f"Loading headers from: {headersFile}")
+        logger.info(f"Loading headers from: {headersFile}")
         try:
             with open(headersFile, "r") as f:
                 config = json.load(f)
             return {"file": headersFile, "config": config}
         except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in {headersFile}: {e}", file=sys.stderr)
+            logger.error(f"Invalid JSON in {headersFile}: {e}")
             sys.exit(1)
 
-    # Multiple arguments or single non-JSON, treat as custom headers
     customHeaders = {}
     for h in headersArg:
         if ":" in h:
             key, value = h.split(":", 1)
             customHeaders[key.strip()] = value.strip()
         else:
-            print(
-                f"Warning: Invalid header format '{h}' (expected 'Key:Value')",
-                file=sys.stderr,
-            )
-
+            logger.warning(f"Invalid header format '{h}' (expected 'Key:Value')")
     return {"file": None, "config": None, "custom": customHeaders}
 
 
 def main():
     torFactory = None
     overmind = None
-    # suppressTerminalOutput()
+
     parser = argparse.ArgumentParser(
         description="z3rgRush - Tor-powered web fuzzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    z3rgRush -t "http://example.com/SWARM" -w wordlist.txt
-    z3rgRush -t "https://target.com/SWARM" -w dirs.txt -f exts.txt -c 5 --workers 10
-    z3rgRush -t "http://test.com/SWARM" -w files.txt --post-data
+  z3rgRush -t "http://example.com/{SWARM}" -w wordlist.txt
+  z3rgRush -t "https://target.com/{SWARM}" -w dirs.txt -f exts.txt -c 5 --workers 10
+  z3rgRush -t "http://test.com/{SWARM}" -w files.txt --post-data
 """,
     )
     parser.add_argument(
@@ -123,12 +110,7 @@ Examples:
         required=True,
         help="Target website URL (use {SWARM} as fuzz parameter)",
     )
-    parser.add_argument(
-        "-w",
-        "--wordlist",
-        required=True,
-        help="Path to wordlist file",
-    )
+    parser.add_argument("-w", "--wordlist", required=True, help="Path to wordlist file")
     parser.add_argument(
         "-c",
         "--circuits",
@@ -146,7 +128,7 @@ Examples:
         "-f",
         "--filetype",
         default=None,
-        help="Add file extension(s) to SWARM; either a single extension (e.g. '.php') or a wordlist path (one extension per line)",
+        help="Add file extension(s) to SWARM; either a single extension (e.g. '.php') or a wordlist path",
     )
     parser.add_argument(
         "--timeout",
@@ -170,10 +152,7 @@ Examples:
         "--headers",
         nargs="*",
         default=[],
-        help="""Headers config:
-        - JSON file path (e.g. --headers headers.json)
-        - Default uses headers.json if present
-        - OR individual headers: --headers 'Key:Value' 'Key2:Value2'""",
+        help="Headers config: JSON file path OR individual headers 'Key:Value'",
     )
     parser.add_argument(
         "-rc",
@@ -197,22 +176,6 @@ Examples:
         help="Set Recursion on hits, Value sets Depth of Recursion",
     )
 
-    def handleRecursion(round):
-        for url in newTargets:
-            recursionPayloads = payloadFactoryInstance.iteratePayloads(
-                url,
-                filetypes,
-                args.post_data,
-            )
-            overmind.sendPayloads(
-                recursionPayloads,
-                workers=args.workers,
-                timeout=args.timeout,
-                postData=args.post_data,
-                customHeaders=customHeaders,
-                exitEvent=exitEvent,
-            )
-
     args = parser.parse_args()
     args.workers = validateArguments(
         args.target, args.circuits, args.workers, args.post_data
@@ -232,37 +195,34 @@ Examples:
         "##    ███╔╝  █████╔╝██████╔╝██║  ███╗██████╔╝██║   ██║███████╗███████║",
         "##   ███╔╝   ╚═══██╗██╔══██╗██║   ██║██╔══██╗██║   ██║╚════██║██╔══██║",
         "##  ███████╗██████╔╝██║  ██║╚██████╔╝██║  ██║╚██████╔╝███████║██║  ██║",
-        "##  ╚══════╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝",
+        "##  ╚══════╝╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚══════╝╚═╝  ╚═╝",
         "======================================================================",
         "                                                 ## by @derErntehelfer",
         "                                                 =====================",
         " ",
     ]
+    # Use console.print for ASCII art to avoid logger prefixes and newline issues
+    console.print("\n".join(art))
 
-    print("\n".join(art))
-
-    # Parse headers
     headersInfo = parseHeadersArg(args.headers)
     customHeaders = headersInfo.get("custom", {})
+
     try:
         torFactory = torCircuitFactory(
             numberOfCircuits=args.circuits,
             verbose=args.verbose,
         )
     except KeyboardInterrupt:
-        print("\nInterrupted during circuit building. Exiting...")
-        sys.exit(0)  # Clean exit, no traceback
-    except OSError as osError:
-        print(f"z3rgRush: Could not build Circuits: {osError}")
-        exitEvent.set()
-        sys.exit(1)
-    except RuntimeError as runError:
-        print(f"z3rgRush: Could not build Circuits: {runError}")
+        logger.warning("Interrupted during circuit building. Exiting...")
+        sys.exit(0)
+    except (OSError, RuntimeError) as e:
+        logger.error(f"Could not build Circuits: {e}")
         exitEvent.set()
         sys.exit(1)
 
     payloadFactoryInstance = payloadFactory(args.wordlist, args.recursion)
     filetypes = payloadFactoryInstance.loadFiletypes(args.filetype)
+
     overmind = circuitOvermind(
         torFactory,
         headersInfo=headersInfo,
@@ -273,13 +233,40 @@ Examples:
         recursion=args.recursion,
     )
 
+    def handleRecursion(round_depth):
+        newTargets = overmind.getHitsForRecursion()
+        if interruptEvent.is_set():
+            logger.warning("Interrupted: Skipping recursion.")
+            return
+        elif newTargets:
+            logger.info(f"Entering Recursive Fuzzing, current depth: {round_depth + 1}")
+            for url in newTargets:
+                recursionPayloads = payloadFactoryInstance.iteratePayloads(
+                    url,
+                    filetypes,
+                    args.post_data,
+                )
+                overmind.sendPayloads(
+                    recursionPayloads,
+                    workers=args.workers,
+                    timeout=args.timeout,
+                    postData=args.post_data,
+                    customHeaders=customHeaders,
+                    exitEvent=exitEvent,
+                )
+            overmind.cleanUrlListInRecursion()
+        else:
+            logger.info(
+                "No new hits collected on Recursion, ending before end of Depth is reached"
+            )
+            raise StopIteration
+
     try:
         payloadGenerator = payloadFactoryInstance.iteratePayloads(
             args.target,
             filetypes,
             args.post_data,
         )
-
         overmind.sendPayloads(
             payloadGenerator,
             workers=args.workers,
@@ -288,36 +275,26 @@ Examples:
             customHeaders=customHeaders,
             exitEvent=exitEvent,
         )
-        if exitEvent is not None:
-            for round in range(0, args.recursion):
-                newTargets = overmind.getHitsForRecursion()
-                if interruptEvent.is_set():
-                    print("Interrupted: Skipping recursion.", file=sys.stderr)
-                    break
-                elif newTargets != []:
-                    print(
-                        f"z3rgRush: Entering Recursive Fuzzing, current depth: {round + 1}"
-                    )
-                    handleRecursion(round)
-                    overmind.cleanUrlListInRecursion()
-                elif newTargets == []:
-                    print(
-                        "z3rgRush: No new hits collected on Recursion, ending before end of Depth is reached"
-                    )
+
+        if args.recursion > 0:
+            for round_depth in range(args.recursion):
+                try:
+                    handleRecursion(round_depth)
+                except StopIteration:
                     break
 
     except KeyboardInterrupt:
-        print("\nCtrl+C received, shutting down Tor circuits...")
+        logger.warning("Ctrl+C received, shutting down Tor circuits...")
         exitEvent.set()
     except Exception as e:
-        print(f"Aborting: {e}", file=sys.stderr)
+        logger.error(f"Aborting: {e}")
     finally:
         exitEvent.set()
         if overmind is not None:
             overmind.printCollectedOutput()
         if torFactory is not None:
             torFactory.cleanupAll()
-        print("Cleanup done, exiting.", file=sys.stderr)
+        logger.info("Cleanup done, exiting.")
         time.sleep(1)
         os._exit(0)
 

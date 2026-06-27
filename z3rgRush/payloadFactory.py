@@ -14,18 +14,20 @@ class payloadFactory:
     def loadFiletypes(self, filetypeArg):
         if not filetypeArg:
             return [""]
+
         if os.path.isfile(filetypeArg):
             try:
                 with open(filetypeArg, "r") as f:
                     extensions = [line.strip() for line in f if line.strip()]
                 if not extensions:
-                    logger.error(f"[error]{filetypeArg} is empty[/error]")
+                    logger.error(f"{filetypeArg} is empty")
                     sys.exit(1)
                 logger.debug(f"Loaded {len(extensions)} filetypes from {filetypeArg}")
                 return extensions
             except Exception as e:
-                logger.error(f"[error]Error reading {filetypeArg}: {e}[/error]")
+                logger.error(f"Error reading {filetypeArg}: {e}")
                 sys.exit(1)
+
         logger.debug(f"Using single filetype: {filetypeArg}")
         return [filetypeArg]
 
@@ -40,7 +42,7 @@ class payloadFactory:
                 for ext in filetypes:
                     if ext.startswith("."):
                         ext = ext.lstrip(".")
-                    pathFull = path + (("." + ext) if ext else "")
+                    pathFull = path + ("." + ext if ext else "")
 
                     if postData:
                         yield {
@@ -60,4 +62,4 @@ class payloadFactory:
 
     def generatePayloads(self, target, filetypeArg=None, postData=False):
         filetypes = self.loadFiletypes(filetypeArg)
-        return list(self.iteratePayloads(target, self.wordlist, filetypes, postData))
+        return list(self.iteratePayloads(target, filetypes, postData))
