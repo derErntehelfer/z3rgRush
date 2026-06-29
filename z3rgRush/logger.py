@@ -3,6 +3,7 @@ import warnings
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.theme import Theme
+from rich.highlighter import NullHighlighter  # <--- NEW IMPORT
 
 # ==============================================================================
 # SUBDUED MONOCHROMATIC THEME ("Cool Slate")
@@ -41,9 +42,9 @@ cool_slate_theme = Theme(
     }
 )
 
-
 # Single shared Console instance for the entire application
-console = Console(theme=cool_slate_theme)
+# highlighter=NullHighlighter() disables automatic coloring in console.print() calls
+console = Console(theme=cool_slate_theme, highlighter=NullHighlighter())
 
 
 class StemLogFilter(logging.Filter):
@@ -78,7 +79,7 @@ def setup_logging(verbose=False, log_file=None):
         markup=False,
         show_time=False,
         show_path=False,
-        highlighter=None,
+        highlighter=NullHighlighter(),
     )
 
     # Add filters to suppress stem noise
