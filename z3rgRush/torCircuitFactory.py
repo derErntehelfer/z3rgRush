@@ -1,6 +1,5 @@
 import shutil
 import socket
-import sys
 import tempfile
 import time
 import logging
@@ -8,9 +7,6 @@ from contextlib import suppress
 from stem.control import Controller
 from stem.process import launch_tor_with_config
 from rich.progress import Progress, SpinnerColumn, TextColumn
-
-# CRITICAL FIX: Import the shared console from logger.py
-# This ensures RichHandler and Progress bar coordinate terminal output properly
 from logger import console
 
 logger = logging.getLogger("z3rgRush.torCircuitFactory")
@@ -27,12 +23,16 @@ class torCircuitFactory:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            console=console,  # Use the shared console
+            console=console,
+            transient=True,  # <--- FIX 2: Wipes the progress bar cleanly on exit
         ) as progress:
+            # Create a single task and reuse it for all circuits
+            task = progress.add_task("Starting...", total=None)
+
             for currentCircuitNr in range(numberOfCircuits):
-                task = progress.add_task(
-                    f"Building circuit {currentCircuitNr + 1}/{numberOfCircuits}",
-                    total=None,
+                progress.update(
+                    task,
+                    description=f"Building circuit {currentCircuitNr + 1}/{numberOfCircuits}",
                 )
 
                 circuitBuildRetries = 3
@@ -92,12 +92,10 @@ class torCircuitFactory:
             self.circuits.append((torProcess, controller, socksPort, dataDir))
 
             if progress and task:
-                # Update task to show it's ready before removing it
+                # Update task to show it's ready
                 progress.update(
                     task, description=f"Circuit {currentCircuitNr + 1}: Ready"
                 )
-                # CRITICAL FIX: Remove the task so the progress bar doesn't accumulate
-                progress.remove_task(task)
 
             logger.info(f"Circuit {currentCircuitNr} ready (SOCKS: {socksPort})")
 
