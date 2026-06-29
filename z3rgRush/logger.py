@@ -2,9 +2,48 @@ import logging
 import warnings
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.theme import Theme
+
+# ==============================================================================
+# SUBDUED MONOCHROMATIC THEME ("Cool Slate")
+# ==============================================================================
+cool_slate_theme = Theme(
+    {
+        # --- Logging Levels ---
+        "logging.level.debug": "dim #5C7A99",
+        "logging.level.info": "#7A98B5",
+        "logging.level.warning": "#99B3CC",
+        "logging.level.error": "#B8CCE0",
+        "logging.level.critical": "bold #D6E5F3",
+        # --- Progress Bar ---
+        "progress.description": "#7A98B5",
+        "progress.spinner": "#99B3CC",
+        "progress.bar.back": "dim #3D5266",
+        "progress.bar.complete": "#7A98B5",
+        "progress.percentage": "#8CA8C4",
+        # --- General Semantic Styles ---
+        "info": "#7A98B5",
+        "warning": "#99B3CC",
+        "danger": "#B8CCE0",
+        "error": "#B8CCE0",
+        "success": "#8CA8C4",
+        # --- Data Representation (for dicts, lists, tracebacks) ---
+        "repr.number": "#8CA8C4",
+        "repr.string": "#7A98B5",
+        "repr.bool_true": "#99B3CC",
+        "repr.bool_false": "dim #5C7A99",
+        "repr.url": "underline #99B3CC",
+        "repr.none": "dim #5C7A99",
+        # --- Tracebacks ---
+        "traceback.border": "#3D5266",
+        "traceback.title": "#B8CCE0",
+        "traceback.text": "#7A98B5",
+    }
+)
+
 
 # Single shared Console instance for the entire application
-console = Console()
+console = Console(theme=cool_slate_theme)
 
 
 class StemLogFilter(logging.Filter):
@@ -39,6 +78,7 @@ def setup_logging(verbose=False, log_file=None):
         markup=False,
         show_time=False,
         show_path=False,
+        highlighter=None,
     )
 
     # Add filters to suppress stem noise
@@ -47,7 +87,7 @@ def setup_logging(verbose=False, log_file=None):
 
     logging.basicConfig(
         level=log_level,
-        format="%(message)s",
+        format="%(name)s | %(message)s",
         datefmt="[%X]",
         handlers=[rich_handler],
     )

@@ -195,14 +195,13 @@ Examples:
         "##    ███╔╝  █████╔╝██████╔╝██║  ███╗██████╔╝██║   ██║███████╗███████║",
         "##   ███╔╝   ╚═══██╗██╔══██╗██║   ██║██╔══██╗██║   ██║╚════██║██╔══██║",
         "##  ███████╗██████╔╝██║  ██║╚██████╔╝██║  ██║╚██████╔╝███████║██║  ██║",
-        "##  ╚══════╝╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚══════╝╚═╝  ╚═╝",
+        "##  ╚══════╝╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚══════╝  ╚═╝",
         "======================================================================",
         "                                                 ## by @derErntehelfer",
         "                                                 =====================",
         " ",
     ]
-    # Use console.print for ASCII art to avoid logger prefixes and newline issues
-    console.print("\n".join(art))
+    console.print("\n".join(art), style="#7A98B5")
 
     headersInfo = parseHeadersArg(args.headers)
     customHeaders = headersInfo.get("custom", {})
