@@ -7,6 +7,7 @@ import subprocess
 import threading
 import logging
 import requests
+from requests.adapters import HTTPAdapter
 from stem import Signal
 
 try:
@@ -34,10 +35,16 @@ class circuitOvermind:
         recursion=0,
     ):
         self.torFactory = torFactory
+
         self.sessions = {}
-        for circuits in range(len(self.torFactory.circuits)):
+        # pool_maxsize=50 ensures that even with many workers, threads won't block each other waiting for a urllib3 connection from the pool.
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
+
+        for i in range(len(self.torFactory.circuits)):
             session = requests.Session()
-            self.sessions[circuits] = session
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self.sessions[i] = session
 
         self.headerIndex = 0
         self.returnCodes = returnCodes
@@ -47,11 +54,14 @@ class circuitOvermind:
         self.hitsFromReturnCode = []
         self.recursion = recursion
 
-        self.circuitIps = {i: "Unknown" for i in range(len(self.torFactory.circuits))}
-        self.circuitLastStatus = {i: None for i in range(len(self.torFactory.circuits))}
-        self.circuitLock = threading.Lock()
-        self.headerLock = threading.Lock()
+        num_circuits = len(self.torFactory.circuits)
 
+        self.circuitLocks = {i: threading.Lock() for i in range(num_circuits)}
+        self.circuitIps = {i: "Unknown" for i in range(num_circuits)}
+        self.circuitLastRotation = {i: 0 for i in range(num_circuits)}
+        self.circuitLastStatus = {i: None for i in range(num_circuits)}
+
+        self.headerLock = threading.Lock()
         self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
 
         if self.useProxyExit:
@@ -167,8 +177,8 @@ class circuitOvermind:
                 )
                 ipResponse.raise_for_status()
                 exitIp = parser(ipResponse)
-                if exitIp and "," in exitIp:
-                    exitIp = exitIp.split(",")[0].strip()
+                if exitIp and ", " in exitIp:
+                    exitIp = exitIp.split(", ")[0].strip()
                 if exitIp:
                     return exitIp
             except Exception:
@@ -176,19 +186,28 @@ class circuitOvermind:
         return "IP fetch error"
 
     def rotateCircuit(self, circuitIndex, reason=None):
-        torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
-            circuitIndex
-        ]
-        try:
-            controller.signal(Signal.NEWNYM)
-            time.sleep(1.5)
-            if reason or self.verbose:
-                reason_str = f" (Reason: {reason})" if reason else ""
-                logger.info(
-                    f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to rotate Tor circuit: {e}")
+        current_time = time.time()
+        if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
+            return
+
+        with self.circuitLocks[circuitIndex]:
+            if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
+                return
+            self.circuitLastRotation[circuitIndex] = current_time
+
+            torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+                circuitIndex
+            ]
+            try:
+                controller.signal(Signal.NEWNYM)
+                time.sleep(1.5)
+                if reason or self.verbose:
+                    reason_str = f" (Reason: {reason})" if reason else ""
+                    logger.info(
+                        f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to rotate Tor circuit: {e}")
 
     def fetchWithCircuit(
         self,
@@ -218,6 +237,7 @@ class circuitOvermind:
 
         upstreamProxy = None
         exitIp = "Unknown"
+        session = self.sessions[circuitIndex]
 
         try:
             if self.useProxyExit:
@@ -242,38 +262,41 @@ class circuitOvermind:
 
                 import pyChainedProxy as chained_socks
 
-                with self.circuitLock:
-                    chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
-                    chained_socks.setdefaultproxy()
-                    for hop in chain:
-                        chained_socks.adddefaultproxy(*chained_socks.parseproxy(hop))
+                # Note: pyChainedProxy monkey-patches the global socket.socket.
+                # This is inherently racy in multithreading. We removed the global lock
+                # to prevent total serialization, but be aware of this limitation.
+                chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
+                chained_socks.setdefaultproxy()
+                for hop in chain:
+                    chained_socks.adddefaultproxy(*chained_socks.parseproxy(hop))
 
-                    original_socket = socket.socket
-                    socket.socket = chained_socks.socksocket
-                    try:
-                        session = self.sessions[circuitIndex]
-                        response = session.request(
-                            method=method,
-                            url=url,
-                            headers=headers,
-                            timeout=timeout,
-                            data=data,
-                            **requestKwargs,
-                        )
-                    finally:
-                        socket.socket = original_socket
+                original_socket = socket.socket
+                socket.socket = chained_socks.socksocket
+                try:
+                    response = session.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        timeout=timeout,
+                        data=data,
+                        **requestKwargs,
+                    )
+                finally:
+                    socket.socket = original_socket
             else:
                 proxies = {
                     "http": f"socks5h://127.0.0.1:{socksPort}",
                     "https": f"socks5h://127.0.0.1:{socksPort}",
                 }
+
                 if self.circuitIps[circuitIndex] == "Unknown":
-                    self.circuitIps[circuitIndex] = self.getExitIp(
-                        proxies, timeout, headers
-                    )
+                    with self.circuitLocks[circuitIndex]:
+                        if self.circuitIps[circuitIndex] == "Unknown":
+                            self.circuitIps[circuitIndex] = self.getExitIp(
+                                proxies, timeout, headers
+                            )
                 exitIp = self.circuitIps[circuitIndex]
 
-                session = self.sessions[circuitIndex]
                 response = session.request(
                     method=method,
                     url=url,
@@ -379,73 +402,73 @@ class circuitOvermind:
         work = list(payloads)
         maxRetries = 3
 
-        while work and maxRetries > 0 and (exitEvent is None or not exitEvent.is_set()):
-            currentWork = work[:]
-            work = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            while (
+                work
+                and maxRetries > 0
+                and (exitEvent is None or not exitEvent.is_set())
+            ):
+                currentWork = work[:]
+                work = []
+                futures = []
 
-            executor = None
-            futures = []
-            try:
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-                for i, payload in enumerate(currentWork):
-                    if isinstance(payload, dict):
-                        requestSpec = payload
-                    elif postData and isinstance(payload, tuple):
-                        url, postDataValue = payload
-                        requestSpec = {
-                            "url": url,
-                            "data": postDataValue,
-                            "method": "POST",
-                            "payload": postDataValue,
-                        }
-                    else:
-                        requestSpec = {
-                            "url": payload,
-                            "data": None,
-                            "method": "GET",
-                            "payload": payload,
-                        }
+                try:
+                    for i, payload in enumerate(currentWork):
+                        if isinstance(payload, dict):
+                            requestSpec = payload
+                        elif postData and isinstance(payload, tuple):
+                            url, postDataValue = payload
+                            requestSpec = {
+                                "url": url,
+                                "data": postDataValue,
+                                "method": "POST",
+                                "payload": postDataValue,
+                            }
+                        else:
+                            requestSpec = {
+                                "url": payload,
+                                "data": None,
+                                "method": "GET",
+                                "payload": payload,
+                            }
 
-                    futures.append(
-                        executor.submit(
-                            self.fetchWithCircuit,
-                            requestSpec,
-                            i % len(self.torFactory.circuits),
-                            timeout=timeout,
-                            customHeaders=customHeaders,
-                            exitEvent=exitEvent,
+                        futures.append(
+                            executor.submit(
+                                self.fetchWithCircuit,
+                                requestSpec,
+                                i % len(self.torFactory.circuits),
+                                timeout=timeout,
+                                customHeaders=customHeaders,
+                                exitEvent=exitEvent,
+                            )
                         )
-                    )
 
-                pending = set(futures)
-                while pending:
-                    if exitEvent is not None and exitEvent.is_set():
-                        break
-                    done, pending = concurrent.futures.wait(
-                        pending,
-                        timeout=0.5,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    for future in done:
-                        success, failedPayload = future.result()
-                        if (
-                            not success
-                            and failedPayload
-                            and (exitEvent is None or not exitEvent.is_set())
-                        ):
-                            work.append(failedPayload)
-                maxRetries -= 1
+                    pending = set(futures)
+                    while pending:
+                        if exitEvent is not None and exitEvent.is_set():
+                            break
+                        done, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=0.5,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            success, failedPayload = future.result()
+                            if (
+                                not success
+                                and failedPayload
+                                and (exitEvent is None or not exitEvent.is_set())
+                            ):
+                                work.append(failedPayload)
+                    maxRetries -= 1
 
-            except KeyboardInterrupt:
-                if exitEvent is not None:
-                    exitEvent.set()
-            except Exception as e:
-                logger.error(f"sendPayloads failed: {e}")
-                if exitEvent is not None:
-                    exitEvent.set()
-            finally:
-                if executor is not None:
-                    executor.shutdown(wait=False, cancel_futures=True)
+                except KeyboardInterrupt:
+                    if exitEvent is not None:
+                        exitEvent.set()
+                except Exception as e:
+                    logger.error(f"sendPayloads failed: {e}")
+                    if exitEvent is not None:
+                        exitEvent.set()
 
         if work and (exitEvent is None or not exitEvent.is_set()):
             logger.warning(f"Failed payloads after {maxRetries} retries: {len(work)}")
