@@ -36,8 +36,8 @@ class circuitOvermind:
     ):
         self.torFactory = torFactory
 
+        # Shared sessions per circuit with enlarged connection pools
         self.sessions = {}
-        # pool_maxsize=50 ensures that even with many workers, threads won't block each other waiting for a urllib3 connection from the pool.
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
 
         for i in range(len(self.torFactory.circuits)):
@@ -56,10 +56,8 @@ class circuitOvermind:
 
         num_circuits = len(self.torFactory.circuits)
 
-        self.circuitLocks = {i: threading.Lock() for i in range(num_circuits)}
         self.circuitIps = {i: "Unknown" for i in range(num_circuits)}
         self.circuitLastRotation = {i: 0 for i in range(num_circuits)}
-        self.circuitLastStatus = {i: None for i in range(num_circuits)}
 
         self.headerLock = threading.Lock()
         self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
@@ -97,7 +95,6 @@ class circuitOvermind:
             "-s",
             "https://api.proxyscrape.com/v4/free-proxy-list/get?protocol=http&timeout=10000&country=all&ssl=all&anonymity=all&limit=2000&request=displayproxies",
         ]
-
         try:
             result = subprocess.run(curlCmd, capture_output=True, text=True, timeout=15)
             if result.returncode == 0:
@@ -106,12 +103,7 @@ class circuitOvermind:
                     for line in result.stdout.strip().split("\n")
                     if ":" in line
                 ]
-                proxies = []
-                for line in proxyLines:
-                    if ":" in line:
-                        ip, port = line.rsplit(":", 1)
-                        proxies.append(f"http://{ip}:{port}")
-                return proxies[:50]
+                return [f"http://{line}" for line in proxyLines if ":" in line][:50]
         except Exception as e:
             logger.error(f"Proxy collection failed: {e}")
         return []
@@ -121,37 +113,34 @@ class circuitOvermind:
             self.headerIndex += 1
             rotationIndex = self.headerIndex % 100
 
-        userAgentIndex = rotationIndex % len(self.headerSets["user_agents"])
-        acceptIndex = (rotationIndex + 1) % len(self.headerSets["accept_headers"])
-        languageIndex = (rotationIndex + 2) % len(self.headerSets["accept_languages"])
-        encodingIndex = (rotationIndex + 3) % len(self.headerSets["accept_encodings"])
-        refererIndex = (rotationIndex + 4) % len(self.headerSets["referers"])
-        fetchIndex = (rotationIndex + 5) % 4
-
         headers = {
-            "User-Agent": self.headerSets["user_agents"][userAgentIndex],
-            "Accept": self.headerSets["accept_headers"][acceptIndex],
-            "Accept-Language": self.headerSets["accept_languages"][languageIndex],
-            "Accept-Encoding": self.headerSets["accept_encodings"][encodingIndex],
-            "Referer": self.headerSets["referers"][refererIndex],
+            "User-Agent": self.headerSets["user_agents"][
+                rotationIndex % len(self.headerSets["user_agents"])
+            ],
+            "Accept": self.headerSets["accept_headers"][
+                (rotationIndex + 1) % len(self.headerSets["accept_headers"])
+            ],
+            "Accept-Language": self.headerSets["accept_languages"][
+                (rotationIndex + 2) % len(self.headerSets["accept_languages"])
+            ],
+            "Accept-Encoding": self.headerSets["accept_encodings"][
+                (rotationIndex + 3) % len(self.headerSets["accept_encodings"])
+            ],
+            "Referer": self.headerSets["referers"][
+                (rotationIndex + 4) % len(self.headerSets["referers"])
+            ],
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][
-                fetchIndex % len(self.headerSets["sec_fetch_dest"])
-            ],
-            "Sec-Fetch-Mode": self.headerSets["sec_fetch_mode"][
-                fetchIndex % len(self.headerSets["sec_fetch_mode"])
-            ],
-            "Sec-Fetch-Site": self.headerSets["sec_fetch_site"][
-                fetchIndex % len(self.headerSets["sec_fetch_site"])
-            ],
+            "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][rotationIndex % 4],
+            "Sec-Fetch-Mode": self.headerSets["sec_fetch_mode"][rotationIndex % 4],
+            "Sec-Fetch-Site": self.headerSets["sec_fetch_site"][rotationIndex % 4],
             "Sec-Fetch-User": "?1",
             "Sec-CH-UA": '"Chromium";v="129", "Not=A?Brand";v="24", "Google Chrome";v="129"',
             "Sec-CH-UA-Mobile": self.headerSets["sec_ch_ua_mobile"][
-                userAgentIndex % len(self.headerSets["sec_ch_ua_mobile"])
+                rotationIndex % len(self.headerSets["sec_ch_ua_mobile"])
             ],
             "Sec-CH-UA-Platform": self.headerSets["sec_ch_ua_platforms"][
-                userAgentIndex % len(self.headerSets["sec_ch_ua_platforms"])
+                rotationIndex % len(self.headerSets["sec_ch_ua_platforms"])
             ],
         }
         return headers
@@ -169,7 +158,6 @@ class circuitOvermind:
             ("https://httpbin.org/ip", lambda r: r.json().get("origin")),
             ("https://ifconfig.me/ip", lambda r: r.text.strip()),
         ]
-
         for url, parser in endpoints:
             try:
                 ipResponse = requests.get(
@@ -185,29 +173,38 @@ class circuitOvermind:
                 continue
         return "IP fetch error"
 
+    def _fetchIpInBackground(self, circuitIndex, proxies, timeout, headers):
+        """Fetches the exit IP in a background thread to prevent blocking the main request pipeline."""
+
+        def _fetch():
+            ip = self.getExitIp(proxies, timeout, headers)
+            self.circuitIps[circuitIndex] = ip
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
     def rotateCircuit(self, circuitIndex, reason=None):
         current_time = time.time()
+        # Prevent rotation storms without holding a lock during the sleep
         if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
             return
 
-        with self.circuitLocks[circuitIndex]:
-            if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
-                return
-            self.circuitLastRotation[circuitIndex] = current_time
+        # Mark as rotating immediately to prevent duplicate signals
+        self.circuitLastRotation[circuitIndex] = current_time
 
-            torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
-                circuitIndex
-            ]
-            try:
-                controller.signal(Signal.NEWNYM)
-                time.sleep(1.5)
-                if reason or self.verbose:
-                    reason_str = f" (Reason: {reason})" if reason else ""
-                    logger.info(
-                        f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
-                    )
-            except Exception as e:
-                logger.error(f"Failed to rotate Tor circuit: {e}")
+        torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+            circuitIndex
+        ]
+        try:
+            controller.signal(Signal.NEWNYM)
+            # Sleep OUTSIDE of any lock to prevent blocking other threads
+            time.sleep(1.5)
+            if reason or self.verbose:
+                reason_str = f" (Reason: {reason})" if reason else ""
+                logger.info(
+                    f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to rotate Tor circuit: {e}")
 
     def fetchWithCircuit(
         self,
@@ -262,9 +259,6 @@ class circuitOvermind:
 
                 import pyChainedProxy as chained_socks
 
-                # Note: pyChainedProxy monkey-patches the global socket.socket.
-                # This is inherently racy in multithreading. We removed the global lock
-                # to prevent total serialization, but be aware of this limitation.
                 chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
                 chained_socks.setdefaultproxy()
                 for hop in chain:
@@ -290,11 +284,8 @@ class circuitOvermind:
                 }
 
                 if self.circuitIps[circuitIndex] == "Unknown":
-                    with self.circuitLocks[circuitIndex]:
-                        if self.circuitIps[circuitIndex] == "Unknown":
-                            self.circuitIps[circuitIndex] = self.getExitIp(
-                                proxies, timeout, headers
-                            )
+                    self.circuitIps[circuitIndex] = "Fetching..."
+                    self._fetchIpInBackground(circuitIndex, proxies, timeout, headers)
                 exitIp = self.circuitIps[circuitIndex]
 
                 response = session.request(
@@ -308,14 +299,14 @@ class circuitOvermind:
                 )
 
             if self.verbose:
-                if self.useProxyExit and upstreamProxy:
-                    logger.debug(
-                        f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Proxy({upstreamProxy}) --> Exit({exitIp}) --> {url}"
-                    )
-                else:
-                    logger.debug(
-                        f"Overmind: [CHAIN] Local --> Tor({socksPort}) --> Exit({exitIp}) --> {url}"
-                    )
+                chain_str = (
+                    f" --> Proxy({upstreamProxy})"
+                    if self.useProxyExit and upstreamProxy
+                    else ""
+                )
+                logger.debug(
+                    f"Overmind: [CHAIN] Local --> Tor({socksPort}){chain_str} --> Exit({exitIp}) --> {url}"
+                )
 
             resultToCollect = (
                 f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
@@ -402,6 +393,7 @@ class circuitOvermind:
         work = list(payloads)
         maxRetries = 3
 
+        # Create the executor ONCE to avoid thread-spawning overhead
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             while (
                 work
@@ -447,6 +439,7 @@ class circuitOvermind:
                     while pending:
                         if exitEvent is not None and exitEvent.is_set():
                             break
+
                         done, pending = concurrent.futures.wait(
                             pending,
                             timeout=0.5,
@@ -460,6 +453,7 @@ class circuitOvermind:
                                 and (exitEvent is None or not exitEvent.is_set())
                             ):
                                 work.append(failedPayload)
+
                     maxRetries -= 1
 
                 except KeyboardInterrupt:
