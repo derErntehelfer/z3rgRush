@@ -3,9 +3,12 @@ import socket
 import tempfile
 import time
 import logging
+import os
+import subprocess
+import threading
+import concurrent.futures
 from contextlib import suppress
 from stem.control import Controller
-from stem.process import launch_tor_with_config
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from logger import console
 
@@ -18,46 +21,69 @@ class torCircuitFactory:
         self.circuits = []
         self.dataDirs = []
 
-        console.print(f"\nInitializing {numberOfCircuits} Tor circuits...")
+        console.print(f"\nInitializing {numberOfCircuits} Tor circuits in parallel...")
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
-            transient=True,  # <--- FIX 2: Wipes the progress bar cleanly on exit
+            transient=True,
         ) as progress:
-            # Create a single task and reuse it for all circuits
-            task = progress.add_task("Starting...", total=None)
+            task = progress.add_task("Building circuits...", total=numberOfCircuits)
 
-            for currentCircuitNr in range(numberOfCircuits):
-                progress.update(
-                    task,
-                    description=f"Building circuit {currentCircuitNr + 1}/{numberOfCircuits}",
-                )
+            # Build circuits in parallel using ThreadPoolExecutor
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=numberOfCircuits
+            ) as executor:
+                futures = {
+                    executor.submit(self._buildCircuit, i, 3, progress, task): i
+                    for i in range(numberOfCircuits)
+                }
 
-                circuitBuildRetries = 3
-                self.generateCircuit(
-                    currentCircuitNr, circuitBuildRetries, progress, task
-                )
+                for future in concurrent.futures.as_completed(futures):
+                    circuit_idx = futures[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            torProcess, controller, socksPort, dataDir = result
+                            self.circuits.append(
+                                (torProcess, controller, socksPort, dataDir)
+                            )
+                            self.dataDirs.append(dataDir)
+                    except Exception as e:
+                        logger.error(f"Circuit {circuit_idx} failed to build: {e}")
 
-        console.print("All circuits initialized successfully\n")
+        # Prevent cascade failure if all circuits fail
+        if not self.circuits:
+            logger.error("Failed to build ANY circuits. Exiting.")
+            raise RuntimeError("No circuits could be initialized.")
 
-    def findFreePort(self, host="127.0.0.1"):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((host, 0))
-            return sock.getsockname()[1]
+        console.print(
+            f"All circuits initialized successfully ({len(self.circuits)} active)\n"
+        )
 
-    def generateCircuit(
+    def _drainOutput(self, process, circuitNr):
+        """Drains stdout to prevent pipe buffer blocking."""
+        try:
+            for line in iter(process.stdout.readline, b""):
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded and self.verbose:
+                    logger.debug(f"Tor[{circuitNr}]: {decoded}")
+        except Exception:
+            pass
+
+    def _buildCircuit(
         self, currentCircuitNr, circuitBuildRetries, progress=None, task=None
     ):
         if circuitBuildRetries <= 0:
             logger.error(f"Circuit {currentCircuitNr}: Max retries reached")
-            raise RuntimeError("Failed to build all circuits after retries")
+            return None
 
         socksPort = self.findFreePort()
         controlPort = self.findFreePort()
         dataDir = tempfile.mkdtemp()
-        self.dataDirs.append(dataDir)
 
         logger.debug(
             f"Circuit {currentCircuitNr}: Ports {socksPort}/{controlPort}, DataDir: {dataDir}"
@@ -74,13 +100,48 @@ class torCircuitFactory:
         }
 
         try:
-            torProcess = launch_tor_with_config(
-                config=torConfig, timeout=30, take_ownership=True
-            )
-            logger.debug(f"Circuit {currentCircuitNr}: Tor process launched")
+            tor_cmd = shutil.which("tor") or "tor"
+            torrc_path = os.path.join(dataDir, "torrc")
 
-            controller = Controller.from_port(port=controlPort)
-            controller.authenticate()
+            # Write config manually
+            with open(torrc_path, "w") as f:
+                for k, v in torConfig.items():
+                    if isinstance(v, list):
+                        for item in v:
+                            f.write(f"{k} {item}\n")
+                    else:
+                        f.write(f"{k} {v}\n")
+
+            # Launch via subprocess to bypass stem's main-thread timeout restriction
+            torProcess = subprocess.Popen(
+                [tor_cmd, "-f", torrc_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            # Drain stdout in background to prevent blocking
+            threading.Thread(
+                target=self._drainOutput,
+                args=(torProcess, currentCircuitNr),
+                daemon=True,
+            ).start()
+
+            logger.debug(
+                f"Circuit {currentCircuitNr}: Tor process launched via subprocess"
+            )
+
+            # Wait for control port to become available
+            controller = None
+            for _ in range(30):
+                try:
+                    controller = Controller.from_port(port=controlPort)
+                    controller.authenticate()
+                    break
+                except Exception:
+                    time.sleep(1)
+
+            if not controller:
+                raise RuntimeError("Could not connect to Tor control port")
 
             if progress and task:
                 progress.update(
@@ -89,15 +150,16 @@ class torCircuitFactory:
                 )
 
             self.waitForBootstrap(controller, currentCircuitNr)
-            self.circuits.append((torProcess, controller, socksPort, dataDir))
 
             if progress and task:
-                # Update task to show it's ready
                 progress.update(
-                    task, description=f"Circuit {currentCircuitNr + 1}: Ready"
+                    task,
+                    description=f"Circuit {currentCircuitNr + 1}: Ready",
+                    advance=1,
                 )
 
             logger.info(f"Circuit {currentCircuitNr} ready (SOCKS: {socksPort})")
+            return (torProcess, controller, socksPort, dataDir)
 
         except Exception as e:
             logger.error(f"Circuit {currentCircuitNr}: {e}")
@@ -105,21 +167,33 @@ class torCircuitFactory:
 
             if progress and task:
                 progress.update(
-                    task,
-                    description=f"Circuit {currentCircuitNr + 1}: Retrying...",
+                    task, description=f"Circuit {currentCircuitNr + 1}: Retrying..."
                 )
 
-            self.generateCircuit(
+            return self._buildCircuit(
                 currentCircuitNr, circuitBuildRetries - 1, progress, task
             )
 
-    def waitForBootstrap(self, controller, currentCircuitNr):
-        while True:
-            status = controller.get_info("status/bootstrap-phase")
-            logger.debug(f"Circuit {currentCircuitNr}: {status}")
+    def findFreePort(self, host="127.0.0.1"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return sock.getsockname()[1]
 
-            if "100" in status:
-                break
+    def waitForBootstrap(self, controller, currentCircuitNr):
+        start_time = time.time()
+        while True:
+            if time.time() - start_time > 60:
+                raise RuntimeError("Bootstrap timed out after 60 seconds")
+
+            try:
+                status = controller.get_info("status/bootstrap-phase")
+                logger.debug(f"Circuit {currentCircuitNr}: {status}")
+
+                if "100" in status:
+                    break
+            except Exception as e:
+                logger.debug(f"Circuit {currentCircuitNr}: Control port error: {e}")
+
             time.sleep(1)
 
     def cleanupSingle(self, dataDir):
