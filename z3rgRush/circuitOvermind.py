@@ -387,7 +387,6 @@ class circuitOvermind:
         exitEvent=None,
     ):
         # Pre-allocate circuit indices to avoid contention
-        circuit_assignments = list(range(len(self.torFactory.circuits)))
         work = list(payloads)
         maxRetries = 3
 
