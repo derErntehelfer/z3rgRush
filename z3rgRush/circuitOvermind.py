@@ -38,7 +38,9 @@ class circuitOvermind:
 
         # Shared sessions per circuit with enlarged connection pools
         self.sessions = {}
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50)
+        num_circuits = len(self.torFactory.circuits)
+        pool_size = max(50, num_circuits * 10)  # Scale with circuit count
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
 
         for i in range(len(self.torFactory.circuits)):
             session = requests.Session()
@@ -53,8 +55,6 @@ class circuitOvermind:
         self.useProxyExit = proxySet
         self.hitsFromReturnCode = []
         self.recursion = recursion
-
-        num_circuits = len(self.torFactory.circuits)
 
         self.circuitIps = {i: "Unknown" for i in range(num_circuits)}
         self.circuitLastRotation = {i: 0 for i in range(num_circuits)}
@@ -184,27 +184,23 @@ class circuitOvermind:
 
     def rotateCircuit(self, circuitIndex, reason=None):
         current_time = time.time()
-        # Prevent rotation storms without holding a lock during the sleep
         if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
             return
 
-        # Mark as rotating immediately to prevent duplicate signals
-        self.circuitLastRotation[circuitIndex] = current_time
+        # Use a separate thread for rotation to avoid blocking
+        def do_rotation():
+            self.circuitLastRotation[circuitIndex] = time.time()
+            torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+                circuitIndex
+            ]
+            try:
+                controller.signal(Signal.NEWNYM)
+                if reason or self.verbose:
+                    logger.info(f"Overmind: Circuit {circuitIndex} rotation initiated")
+            except Exception as e:
+                logger.error(f"Failed to rotate Tor circuit: {e}")
 
-        torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
-            circuitIndex
-        ]
-        try:
-            controller.signal(Signal.NEWNYM)
-            # Sleep OUTSIDE of any lock to prevent blocking other threads
-            time.sleep(1.5)
-            if reason or self.verbose:
-                reason_str = f" (Reason: {reason})" if reason else ""
-                logger.info(
-                    f"Overmind: Circuit {circuitIndex} rotated successfully{reason_str}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to rotate Tor circuit: {e}")
+        threading.Thread(target=do_rotation, daemon=True).start()
 
     def fetchWithCircuit(
         self,
@@ -390,6 +386,8 @@ class circuitOvermind:
         customHeaders=None,
         exitEvent=None,
     ):
+        # Pre-allocate circuit indices to avoid contention
+        circuit_assignments = list(range(len(self.torFactory.circuits)))
         work = list(payloads)
         maxRetries = 3
 
