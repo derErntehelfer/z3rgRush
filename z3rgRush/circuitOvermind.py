@@ -117,6 +117,7 @@ class circuitOvermind:
             self.headerIndex += 1
             rotationIndex = self.headerIndex % 100
 
+        # Base headers applicable to all methods
         headers = {
             "User-Agent": self.headerSets["user_agents"][
                 rotationIndex % len(self.headerSets["user_agents"])
@@ -134,19 +135,8 @@ class circuitOvermind:
                 (rotationIndex + 4) % len(self.headerSets["referers"])
             ],
             "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][rotationIndex % 4],
-            "Sec-Fetch-Mode": self.headerSets["sec_fetch_mode"][rotationIndex % 4],
-            "Sec-Fetch-Site": self.headerSets["sec_fetch_site"][rotationIndex % 4],
-            "Sec-Fetch-User": "?1",
-            "Sec-CH-UA": '"Chromium";v="129", "Not=A?Brand";v="24", "Google Chrome";v="129"',
-            "Sec-CH-UA-Mobile": self.headerSets["sec_ch_ua_mobile"][
-                rotationIndex % len(self.headerSets["sec_ch_ua_mobile"])
-            ],
-            "Sec-CH-UA-Platform": self.headerSets["sec_ch_ua_platforms"][
-                rotationIndex % len(self.headerSets["sec_ch_ua_platforms"])
-            ],
         }
+
         return headers
 
     def printHeadersVerbose(self, headers):
@@ -249,19 +239,63 @@ class circuitOvermind:
         if exitEvent is not None and exitEvent.is_set():
             return False, requestSpec
 
-        headers = self.getNextHeaders()
-        if customHeaders:
-            headers.update(customHeaders)
-
         url = requestSpec.get("url")
         method = requestSpec.get("method", "GET")
-        data = requestSpec.get("data", None)
+        headers = self.getNextHeaders()
+        with self.headerLock:
+            self.headerIndex += 1
+            rotationIndex = self.headerIndex % 100
+        if method.upper() in ["GET", "HEAD", "OPTIONS"]:
+            headers.update(
+                {
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-Mode": self.headerSets["sec_fetch_mode"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-Site": self.headerSets["sec_fetch_site"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-User": "?1",
+                    "Sec-CH-UA": '"Chromium";v="129", "Not=A?Brand";v="24", "Google Chrome";v="129"',
+                    "Sec-CH-UA-Mobile": self.headerSets["sec_ch_ua_mobile"][
+                        rotationIndex % len(self.headerSets["sec_ch_ua_mobile"])
+                    ],
+                    "Sec-CH-UA-Platform": self.headerSets["sec_ch_ua_platforms"][
+                        rotationIndex % len(self.headerSets["sec_ch_ua_platforms"])
+                    ],
+                }
+            )
+        requestData = requestSpec.get("data")
+        requestJson = requestSpec.get("json")
+        contentType = requestSpec.get("contentType")
+
+        if contentType:
+            headers["Content-Type"] = contentType
+
+        if customHeaders:
+            headers.update(customHeaders)
 
         upstreamProxy = None
         exitIp = "Unknown"
         session = self.sessions[circuitIndex]
 
         try:
+            requestKwargs = {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "timeout": timeout,
+            }
+
+            if requestJson is not None:
+                requestKwargs["json"] = requestJson
+
+            elif requestData is not None:
+                requestKwargs["data"] = requestData
+
             if self.useProxyExit:
                 availableProxies = [
                     p for p in self.upstreamProxies if p not in self.badProxies
@@ -292,14 +326,7 @@ class circuitOvermind:
                 original_socket = socket.socket
                 socket.socket = chained_socks.socksocket
                 try:
-                    response = session.request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        timeout=timeout,
-                        data=data,
-                        **requestKwargs,
-                    )
+                    response = session.request(**requestKwargs)
                 finally:
                     socket.socket = original_socket
             else:
@@ -313,15 +340,7 @@ class circuitOvermind:
                     self._fetchIpInBackground(circuitIndex, proxies, timeout, headers)
                 exitIp = self.circuitIps[circuitIndex]
 
-                response = session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    timeout=timeout,
-                    data=data,
-                    proxies=proxies,
-                    **requestKwargs,
-                )
+                response = session.request(**requestKwargs, proxies=proxies)
 
             if self.verbose:
                 chain_str = (

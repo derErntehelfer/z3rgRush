@@ -28,16 +28,21 @@ def suppressTerminalOutput():
     atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
 
 
-def validateArguments(url, circuits, workers, postData):
+def validateArguments(url, circuits, workers, postData, bodyTemplate, method):
     parsed = urlparse(url)
     maxCircuits = 16
     if not parsed.scheme or parsed.scheme not in ("http", "https"):
         logger.error(f"URL must start with http:// or https:// ('{url}')")
         sys.exit(1)
 
-    if not postData and "{SWARM}" not in url:
+    # Check if {SWARM} is in URL OR Body Template
+    hasSwarmInUrl = "{SWARM}" in url
+    hasSwarmInBody = bodyTemplate is not None and "{SWARM}" in bodyTemplate
+
+    if not postData and not hasSwarmInUrl and not hasSwarmInBody:
         logger.error(
-            "Target URL must contain '{{SWARM}}' placeholder for GET fuzzing (e.g., http://target.com/{{SWARM}})"
+            "The '{SWARM}' placeholder must be present in the target URL or the body template (-d), "
+            "or use --post-data to use wordlist entries as the body."
         )
         sys.exit(1)
 
@@ -46,7 +51,6 @@ def validateArguments(url, circuits, workers, postData):
         sys.exit(1)
 
     if workers is None:
-        # Default to 10 workers per circuit, ensuring a minimum baseline of 16
         workers = max(16, circuits * 10)
         logger.info(f"Auto-configured {workers} workers for {circuits} circuits.")
 
@@ -155,6 +159,13 @@ Examples:
         help="Use wordlist entries as POST data instead of URL fuzzing",
     )
     parser.add_argument(
+        "-d",
+        "--body",
+        default=None,
+        help="Request body template. Use {SWARM} as the injection point. "
+        'Auto-detects JSON or Form data (e.g. -d \'{"user":"admin","pass":"{SWARM}"}\')',
+    )
+    parser.add_argument(
         "--headers",
         nargs="*",
         default=[],
@@ -185,7 +196,7 @@ Examples:
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
     args.workers = validateArguments(
-        args.target, args.circuits, args.workers, args.post_data
+        args.target, args.circuits, args.workers, args.post_data, args.body, args.method
     )
 
     def handleSigint(signum, frame):
@@ -274,6 +285,7 @@ Examples:
             filetypes=filetypes,
             method=args.method,
             postData=args.post_data,
+            bodyTemplate=args.body,  # <--- ADD THIS
         )
         overmind.sendPayloads(
             payloadGenerator,
