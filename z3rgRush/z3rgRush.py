@@ -46,10 +46,10 @@ def validateArguments(url, circuits, workers, postData):
         sys.exit(1)
 
     if workers is None:
-        return min(16, circuits)
-    if workers > circuits:
-        logger.warning(f"Limiting workers to {circuits} (same as circuits).")
-        return circuits
+        # Default to 10 workers per circuit, ensuring a minimum baseline of 16
+        workers = max(16, circuits * 10)
+        logger.info(f"Auto-configured {workers} workers for {circuits} circuits.")
+
     return workers
 
 

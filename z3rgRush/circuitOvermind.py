@@ -59,6 +59,10 @@ class circuitOvermind:
         self.circuitIps = {i: "Unknown" for i in range(num_circuits)}
         self.circuitLastRotation = {i: 0 for i in range(num_circuits)}
 
+        self.circuitCooldownUntil = {i: 0.0 for i in range(num_circuits)}
+        self.circuitCounter = 0
+        self.counterLock = threading.Lock()
+
         self.headerLock = threading.Lock()
         self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
 
@@ -187,6 +191,9 @@ class circuitOvermind:
         if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
             return
 
+        self.circuitCooldownUntil[circuitIndex] = current_time + 15.0
+        self.circuitLastRotation[circuitIndex] = current_time
+
         # Use a separate thread for rotation to avoid blocking
         def do_rotation():
             self.circuitLastRotation[circuitIndex] = time.time()
@@ -201,6 +208,28 @@ class circuitOvermind:
                 logger.error(f"Failed to rotate Tor circuit: {e}")
 
         threading.Thread(target=do_rotation, daemon=True).start()
+
+    def getAvailableCircuit(self):
+        """Returns the index of a healthy circuit, avoiding those in cooldown."""
+        current_time = time.time()
+
+        # Find circuits that are NOT in cooldown
+        available_circuits = [
+            idx
+            for idx, cooldown_time in self.circuitCooldownUntil.items()
+            if current_time >= cooldown_time
+        ]
+
+        # Fallback: If ALL circuits are in cooldown, pick the one recovering soonest
+        if not available_circuits:
+            return min(self.circuitCooldownUntil, key=self.circuitCooldownUntil.get)
+
+        # Thread-safe round-robin among healthy circuits
+        with self.counterLock:
+            idx = self.circuitCounter % len(available_circuits)
+            self.circuitCounter += 1
+
+        return available_circuits[idx]
 
     def fetchWithCircuit(
         self,
@@ -421,11 +450,13 @@ class circuitOvermind:
                                 "payload": payload,
                             }
 
+                        circuit_idx = self.getAvailableCircuit()
+
                         futures.append(
                             executor.submit(
                                 self.fetchWithCircuit,
                                 requestSpec,
-                                i % len(self.torFactory.circuits),
+                                circuit_idx,
                                 timeout=timeout,
                                 customHeaders=customHeaders,
                                 exitEvent=exitEvent,
