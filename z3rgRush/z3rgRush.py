@@ -9,16 +9,15 @@ import subprocess
 import signal
 import atexit
 import logging
+import argcomplete
 from urllib.parse import urlparse
-
-# Import logger and console first
-from logger import setup_logging, console
-
-logger = logging.getLogger("z3rgRush.main")
-
 from circuitOvermind import circuitOvermind
 from payloadFactory import payloadFactory
 from torCircuitFactory import torCircuitFactory
+from logger import console
+
+logger = logging.getLogger("z3rgRush.main")
+
 
 exitEvent = threading.Event()
 interruptEvent = threading.Event()
@@ -143,9 +142,16 @@ Examples:
         help="Enable verbose output (bootstrap-phase logs)",
     )
     parser.add_argument(
+        "-m",
+        "--method",
+        default="GET",
+        choices=["GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE"],
+        help="HTTP method to use (default: GET). Overrides --post-data if used.",
+    )
+    parser.add_argument(
         "--post-data",
         action="store_true",
-        default=None,
+        default=False,
         help="Use wordlist entries as POST data instead of URL fuzzing",
     )
     parser.add_argument(
@@ -176,6 +182,7 @@ Examples:
         help="Set Recursion on hits, Value sets Depth of Recursion",
     )
 
+    argcomplete.autocomplete(parser)
     args = parser.parse_args()
     args.workers = validateArguments(
         args.target, args.circuits, args.workers, args.post_data
@@ -241,9 +248,10 @@ Examples:
             logger.info(f"Entering Recursive Fuzzing, current depth: {round_depth + 1}")
             for url in newTargets:
                 recursionPayloads = payloadFactoryInstance.iteratePayloads(
-                    url,
-                    filetypes,
-                    args.post_data,
+                    target=url,
+                    filetypes=filetypes,
+                    method=args.method,
+                    postData=args.post_data,
                 )
                 overmind.sendPayloads(
                     recursionPayloads,
@@ -262,9 +270,10 @@ Examples:
 
     try:
         payloadGenerator = payloadFactoryInstance.iteratePayloads(
-            args.target,
-            filetypes,
-            args.post_data,
+            target=args.target,
+            filetypes=filetypes,
+            method=args.method,
+            postData=args.post_data,
         )
         overmind.sendPayloads(
             payloadGenerator,

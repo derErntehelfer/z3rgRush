@@ -14,7 +14,6 @@ class payloadFactory:
     def loadFiletypes(self, filetypeArg):
         if not filetypeArg:
             return [""]
-
         if os.path.isfile(filetypeArg):
             try:
                 with open(filetypeArg, "r") as f:
@@ -27,12 +26,12 @@ class payloadFactory:
             except Exception as e:
                 logger.error(f"Error reading {filetypeArg}: {e}")
                 sys.exit(1)
-
         logger.debug(f"Using single filetype: {filetypeArg}")
         return [filetypeArg]
 
-    def iteratePayloads(self, target, filetypes=None, postData=False):
+    def iteratePayloads(self, target, filetypes=None, method="GET", postData=False):
         filetypes = filetypes or [""]
+        effectiveMethod = "POST" if postData else method.upper()
 
         with open(self.wordlist, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -44,7 +43,7 @@ class payloadFactory:
                         ext = ext.lstrip(".")
                     pathFull = path + ("." + ext if ext else "")
 
-                    if postData:
+                    if effectiveMethod == "POST":
                         yield {
                             "url": target,
                             "data": pathFull,
@@ -56,10 +55,10 @@ class payloadFactory:
                         yield {
                             "url": requestUrl,
                             "data": None,
-                            "method": "GET",
+                            "method": effectiveMethod,
                             "payload": requestUrl,
                         }
 
     def generatePayloads(self, target, filetypeArg=None, postData=False):
         filetypes = self.loadFiletypes(filetypeArg)
-        return list(self.iteratePayloads(target, filetypes, postData))
+        return list(self.iteratePayloads(target, filetypes, postData=postData))
