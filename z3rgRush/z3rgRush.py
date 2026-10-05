@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# /z3rgRush/z3rgRush.py
 import argparse
 import sys
 import os
