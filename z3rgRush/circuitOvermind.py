@@ -8,8 +8,10 @@ import time
 import subprocess
 import threading
 import logging
-
 import requests
+
+from contextlib import suppress
+from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from stem import Signal
 
@@ -21,7 +23,7 @@ except ImportError:
 
         sys.modules["socks"] = socks
     except ImportError:
-        pass
+        socks = None
 
 logger = logging.getLogger("z3rgRush.circuitOvermind")
 
@@ -38,6 +40,459 @@ DEFAULT_HEADER_SETS = {
     "sec_ch_ua_mobile": ["?0"],
     "sec_ch_ua_platforms": ['"Windows"'],
 }
+
+
+class circuitExitSidecar:
+    """
+    Minimal local HTTP proxy sidecar for one Tor circuit.
+
+    requests -> local sidecar -> Tor SOCKS -> upstream proxy -> target
+
+    The upstream proxy is chosen dynamically per connection.
+    """
+
+    def __init__(self, circuitIndex, socksPort, overmind):
+        self.circuitIndex = circuitIndex
+        self.socksPort = socksPort
+        self.overmind = overmind
+
+        self.running = False
+        self.listener = None
+        self.port = None
+        self.thread = None
+
+    def start(self):
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(128)
+
+        self.port = self.listener.getsockname()[1]
+        self.running = True
+
+        self.thread = threading.Thread(target=self._acceptLoop, daemon=True)
+        self.thread.start()
+
+        logger.info(
+            f"Overmind: Started exit sidecar for circuit {self.circuitIndex} "
+            f"on 127.0.0.1:{self.port}"
+        )
+
+    def stop(self):
+        self.running = False
+
+        if self.listener is not None:
+            with suppress(Exception):
+                self.listener.close()
+
+    def _acceptLoop(self):
+        self.listener.settimeout(0.5)
+
+        while self.running:
+            try:
+                clientSocket, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            threading.Thread(
+                target=self._handleClient,
+                args=(clientSocket,),
+                daemon=True,
+            ).start()
+
+    def _handleClient(self, clientSocket):
+        try:
+            clientSocket.settimeout(30)
+
+            head, remainder = self._readHead(clientSocket)
+            if not head:
+                return
+
+            lines = head.split(b"\r\n")
+            if not lines:
+                return
+
+            requestLine = lines[0].decode("latin-1", "ignore")
+            headerLines = lines[1:]
+
+            parts = requestLine.split()
+            if len(parts) < 3:
+                return
+
+            method = parts[0].upper()
+            target = parts[1]
+
+            if method == "CONNECT":
+                self._handleConnect(
+                    clientSocket=clientSocket,
+                    authority=target,
+                    headerLines=headerLines,
+                    remainder=remainder,
+                )
+            else:
+                self._handleHttp(
+                    clientSocket=clientSocket,
+                    requestLine=requestLine,
+                    headerLines=headerLines,
+                    remainder=remainder,
+                )
+
+        except Exception as err:
+            logger.debug(
+                f"Sidecar circuit {self.circuitIndex}: client handler error: {err}"
+            )
+        finally:
+            with suppress(Exception):
+                clientSocket.close()
+
+    def _readHead(self, sock):
+        data = b""
+
+        try:
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+
+                data += chunk
+
+                if len(data) > 1048576:
+                    break
+        except Exception:
+            return None, b""
+
+        if b"\r\n\r\n" not in data:
+            return None, b""
+
+        head, remainder = data.split(b"\r\n\r\n", 1)
+        return head, remainder
+
+    def _getHeaderValue(self, headerLines, headerName):
+        headerName = headerName.lower()
+
+        for line in headerLines:
+            if b":" not in line:
+                continue
+
+            key, value = line.split(b":", 1)
+            key = key.decode("latin-1", "ignore").strip().lower()
+
+            if key == headerName:
+                return value.decode("latin-1", "ignore").strip()
+
+        return None
+
+    def _buildHttpHead(self, requestLine, headerLines, targetUrl):
+        parsedTarget = urlparse(targetUrl)
+
+        newHeaders = []
+        hasHost = False
+
+        for line in headerLines:
+            if b":" not in line:
+                continue
+
+            key = line.split(b":", 1)[0].decode("latin-1", "ignore").strip().lower()
+
+            if key in ("connection", "proxy-connection"):
+                continue
+
+            if key == "host":
+                hasHost = True
+
+            newHeaders.append(line)
+
+        if not hasHost and parsedTarget.netloc:
+            newHeaders.append(
+                f"Host: {parsedTarget.netloc}".encode("latin-1", "ignore")
+            )
+
+        newHeaders.append(b"Connection: close")
+        newHeaders.append(b"Proxy-Connection: close")
+
+        return (
+            requestLine.encode("latin-1", "ignore")
+            + b"\r\n"
+            + b"\r\n".join(newHeaders)
+            + b"\r\n\r\n"
+        )
+
+    def _connectViaTor(self, upstreamProxy):
+        socksModule = self.overmind.socksModule
+
+        if socksModule is None:
+            raise RuntimeError("SOCKS module unavailable")
+
+        if "://" not in upstreamProxy:
+            upstreamProxy = f"http://{upstreamProxy}"
+
+        parsedProxy = urlparse(upstreamProxy)
+
+        proxyHost = parsedProxy.hostname
+        proxyPort = parsedProxy.port or 80
+
+        if not proxyHost:
+            raise ValueError(f"Invalid upstream proxy: {upstreamProxy}")
+
+        upstreamSocket = socksModule.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+        upstreamSocket.settimeout(15)
+
+        if parsedProxy.username:
+            upstreamSocket.set_proxy(
+                socksModule.SOCKS5,
+                "127.0.0.1",
+                self.socksPort,
+                rdns=True,
+                username=parsedProxy.username,
+                password=parsedProxy.password,
+            )
+        else:
+            upstreamSocket.set_proxy(
+                socksModule.SOCKS5,
+                "127.0.0.1",
+                self.socksPort,
+                rdns=True,
+            )
+
+        upstreamSocket.connect((proxyHost, proxyPort))
+        return upstreamSocket
+
+    def _handleHttp(self, clientSocket, requestLine, headerLines, remainder):
+        parts = requestLine.split()
+        if len(parts) < 3:
+            return
+
+        method, target, version = parts[:3]
+
+        if not target.lower().startswith("http://"):
+            host = self._getHeaderValue(headerLines, "Host")
+            if not host:
+                self._sendHttpError(clientSocket, 400, "Missing Host header")
+                return
+
+            target = f"http://{host}{target}"
+            requestLine = f"{method} {target} {version}"
+
+        transferEncoding = self._getHeaderValue(headerLines, "Transfer-Encoding")
+        if transferEncoding and "chunked" in transferEncoding.lower():
+            self._sendHttpError(
+                clientSocket,
+                400,
+                "Chunked request bodies are not supported by this minimal sidecar",
+            )
+            return
+
+        upstreamProxy = self.overmind.chooseUpstreamProxy()
+        if not upstreamProxy:
+            self._sendHttpError(clientSocket, 502, "No upstream proxy available")
+            return
+
+        try:
+            upstreamSocket = self._connectViaTor(upstreamProxy)
+        except Exception as err:
+            logger.debug(
+                f"Sidecar circuit {self.circuitIndex}: "
+                f"upstream connect failed for {upstreamProxy}: {err}"
+            )
+            self.overmind.markBadUpstreamProxy(upstreamProxy)
+            self._sendHttpError(clientSocket, 502, "Upstream proxy connect failed")
+            return
+
+        try:
+            upstreamSocket.settimeout(30)
+
+            contentLengthValue = self._getHeaderValue(headerLines, "Content-Length")
+            try:
+                contentLength = int(contentLengthValue or 0)
+            except Exception:
+                contentLength = 0
+
+            headOut = self._buildHttpHead(
+                requestLine=requestLine,
+                headerLines=headerLines,
+                targetUrl=target,
+            )
+
+            upstreamSocket.sendall(headOut)
+
+            self._forwardBody(
+                clientSocket=clientSocket,
+                upstreamSocket=upstreamSocket,
+                contentLength=contentLength,
+                remainder=remainder,
+            )
+
+            self._relay(
+                sourceSocket=upstreamSocket,
+                destinationSocket=clientSocket,
+            )
+
+        except Exception as err:
+            logger.debug(
+                f"Sidecar circuit {self.circuitIndex}: "
+                f"HTTP proxy error for {upstreamProxy}: {err}"
+            )
+            self.overmind.markBadUpstreamProxy(upstreamProxy)
+        finally:
+            with suppress(Exception):
+                upstreamSocket.close()
+
+    def _handleConnect(self, clientSocket, authority, headerLines, remainder):
+        upstreamProxy = self.overmind.chooseUpstreamProxy()
+
+        if not upstreamProxy:
+            self._sendHttpError(clientSocket, 502, "No upstream proxy available")
+            return
+
+        try:
+            upstreamSocket = self._connectViaTor(upstreamProxy)
+        except Exception as err:
+            logger.debug(
+                f"Sidecar circuit {self.circuitIndex}: "
+                f"CONNECT upstream connect failed for {upstreamProxy}: {err}"
+            )
+            self.overmind.markBadUpstreamProxy(upstreamProxy)
+            self._sendHttpError(clientSocket, 502, "Upstream proxy connect failed")
+            return
+
+        try:
+            connectHead = (
+                f"CONNECT {authority} HTTP/1.1\r\n"
+                f"Host: {authority}\r\n"
+                "Proxy-Connection: close\r\n"
+                "\r\n"
+            ).encode("latin-1", "ignore")
+
+            upstreamSocket.sendall(connectHead)
+
+            responseHead, responseRemainder = self._readHead(upstreamSocket)
+            if not responseHead:
+                self.overmind.markBadUpstreamProxy(upstreamProxy)
+                self._sendHttpError(clientSocket, 502, "Upstream CONNECT failed")
+                return
+
+            statusLine = responseHead.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+            statusParts = statusLine.split()
+
+            if len(statusParts) < 2 or not statusParts[1].startswith("2"):
+                self.overmind.markBadUpstreamProxy(upstreamProxy)
+                self._sendHttpError(
+                    clientSocket,
+                    502,
+                    f"Upstream CONNECT rejected: {statusLine}",
+                )
+                return
+
+            clientSocket.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+            clientSocket.settimeout(None)
+            upstreamSocket.settimeout(None)
+
+            self._tunnel(
+                clientSocket=clientSocket,
+                upstreamSocket=upstreamSocket,
+                initialData=responseRemainder,
+            )
+
+        except Exception as err:
+            logger.debug(
+                f"Sidecar circuit {self.circuitIndex}: "
+                f"CONNECT error via {upstreamProxy}: {err}"
+            )
+            self.overmind.markBadUpstreamProxy(upstreamProxy)
+        finally:
+            with suppress(Exception):
+                upstreamSocket.close()
+
+    def _forwardBody(self, clientSocket, upstreamSocket, contentLength, remainder):
+        if contentLength <= 0:
+            return
+
+        if remainder:
+            chunk = remainder[:contentLength]
+            if chunk:
+                upstreamSocket.sendall(chunk)
+            contentLength -= len(chunk)
+
+        while contentLength > 0:
+            chunk = clientSocket.recv(min(65536, contentLength))
+            if not chunk:
+                break
+
+            upstreamSocket.sendall(chunk)
+            contentLength -= len(chunk)
+
+    def _relay(self, sourceSocket, destinationSocket):
+        try:
+            while True:
+                data = sourceSocket.recv(65536)
+                if not data:
+                    break
+
+                destinationSocket.sendall(data)
+        except Exception:
+            pass
+
+    def _tunnel(self, clientSocket, upstreamSocket, initialData=b""):
+        if initialData:
+            try:
+                clientSocket.sendall(initialData)
+            except Exception:
+                return
+
+        clientThread = threading.Thread(
+            target=self._pipe,
+            args=(clientSocket, upstreamSocket),
+            daemon=True,
+        )
+
+        upstreamThread = threading.Thread(
+            target=self._pipe,
+            args=(upstreamSocket, clientSocket),
+            daemon=True,
+        )
+
+        clientThread.start()
+        upstreamThread.start()
+
+        clientThread.join()
+        upstreamThread.join()
+
+    def _pipe(self, sourceSocket, destinationSocket):
+        try:
+            while True:
+                data = sourceSocket.recv(65536)
+                if not data:
+                    break
+
+                destinationSocket.sendall(data)
+        except Exception:
+            pass
+        finally:
+            with suppress(Exception):
+                destinationSocket.shutdown(socket.SHUT_WR)
+
+    def _sendHttpError(self, clientSocket, statusCode, message):
+        reasonMap = {
+            400: "Bad Request",
+            502: "Bad Gateway",
+        }
+
+        reason = reasonMap.get(statusCode, "Error")
+        body = f"{message}\n".encode("utf-8", "ignore")
+
+        response = (
+            f"HTTP/1.1 {statusCode} {reason}\r\n"
+            "Content-Type: text/plain\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("latin-1", "ignore") + body
+
+        with suppress(Exception):
+            clientSocket.sendall(response)
 
 
 class circuitOvermind:
@@ -117,36 +572,59 @@ class circuitOvermind:
             502,
             504,
         }
-
         self.useProxyExit = proxySet
         self.proxyExitAvailable = False
         self.chainedSocks = None
         self.upstreamProxies = []
         self.badProxies = set()
 
-        if self.useProxyExit:
-            try:
-                import pyChainedProxy as chained_socks
+        self.proxyLock = threading.Lock()
+        self.exitSidecars = {}
+        self.socksModule = globals().get("socks")
 
-                self.chainedSocks = chained_socks
-                self.proxyExitAvailable = True
-            except Exception as err:
+        if self.useProxyExit:
+            if (
+                self.socksModule is None
+                or not hasattr(self.socksModule, "socksocket")
+                or not hasattr(self.socksModule, "SOCKS5")
+            ):
                 logger.error(
-                    "Overmind: pyChainedProxy is unavailable. "
-                    f"Disabling exit proxy mode. Error: {err}"
+                    "Overmind: PySocks-compatible SOCKS support is unavailable. "
+                    "Disabling exit proxy mode."
                 )
                 self.useProxyExit = False
+            else:
+                self.proxyExitAvailable = True
 
-            if self.useProxyExit:
-                self.upstreamProxies = self.collectProxyscrapeProxies()
-                logger.info(
-                    f"Overmind: Collected {len(self.upstreamProxies)} upstream proxies"
+        if self.useProxyExit and self.proxyExitAvailable:
+            self.upstreamProxies = self.collectProxyscrapeProxies()
+
+            logger.info(
+                f"Overmind: Collected {len(self.upstreamProxies)} upstream proxies"
+            )
+
+            if not self.upstreamProxies:
+                logger.warning(
+                    "Overmind: No upstream proxies collected. "
+                    "Exit proxy mode will fall back to Tor-only as needed."
                 )
 
-                if not self.upstreamProxies:
-                    logger.warning(
-                        "Overmind: No upstream proxies collected. "
-                        "Exit proxy mode will fall back to Tor-only as needed."
+            for i in range(num_circuits):
+                try:
+                    _, _, socksPort, _ = self.torFactory.circuits[i]
+
+                    sidecar = circuitExitSidecar(
+                        circuitIndex=i,
+                        socksPort=socksPort,
+                        overmind=self,
+                    )
+
+                    sidecar.start()
+                    self.exitSidecars[i] = sidecar
+
+                except Exception as err:
+                    logger.error(
+                        f"Overmind: Failed to start exit sidecar for circuit {i}: {err}"
                     )
 
         self.headerSets = self.normalizeHeaderSets(headersInfo)
@@ -226,6 +704,49 @@ class circuitOvermind:
             logger.error(f"Proxy collection failed: {err}")
 
         return []
+
+    def chooseUpstreamProxy(self):
+        with self.proxyLock:
+            availableProxies = [
+                proxy for proxy in self.upstreamProxies if proxy not in self.badProxies
+            ]
+
+            if not availableProxies:
+                logger.warning("Overmind: All upstream proxies failed - refetching...")
+
+                self.upstreamProxies = self.collectProxyscrapeProxies()
+                self.badProxies.clear()
+
+                availableProxies = [
+                    proxy
+                    for proxy in self.upstreamProxies
+                    if proxy not in self.badProxies
+                ]
+
+            if not availableProxies:
+                return None
+
+            return random.choice(availableProxies)
+
+    def markBadUpstreamProxy(self, upstreamProxy):
+        if not upstreamProxy:
+            return
+
+        with self.proxyLock:
+            if upstreamProxy not in self.badProxies:
+                self.badProxies.add(upstreamProxy)
+                logger.warning(
+                    f"Overmind: [BAD PROXY] {upstreamProxy} marked bad by sidecar"
+                )
+
+    def closeSidecars(self):
+        for sidecar in list(self.exitSidecars.values()):
+            try:
+                sidecar.stop()
+            except Exception as err:
+                logger.debug(f"Overmind: Failed stopping sidecar: {err}")
+
+        self.exitSidecars.clear()
 
     def getNextHeaders(self):
         with self.headerLock:
@@ -485,55 +1006,26 @@ class circuitOvermind:
             if (
                 self.useProxyExit
                 and self.proxyExitAvailable
-                and self.chainedSocks is not None
+                and circuitIndex in self.exitSidecars
+                and self.upstreamProxies
             ):
-                availableProxies = [
-                    proxy
-                    for proxy in self.upstreamProxies
-                    if proxy not in self.badProxies
-                ]
+                sidecar = self.exitSidecars[circuitIndex]
+                sidecarUrl = f"http://127.0.0.1:{sidecar.port}"
 
-                if not availableProxies:
-                    logger.warning(
-                        "Overmind: All upstream proxies failed - refetching..."
-                    )
+                proxies = {
+                    "http": sidecarUrl,
+                    "https": sidecarUrl,
+                }
 
-                    self.upstreamProxies = self.collectProxyscrapeProxies()
-                    self.badProxies.clear()
-                    availableProxies = self.upstreamProxies
+                exitIp = f"Tor+Sidecar(127.0.0.1:{sidecar.port})"
 
-                if availableProxies:
-                    upstreamProxy = random.choice(availableProxies)
+                response = session.request(
+                    **requestKwargs,
+                    proxies=proxies,
+                )
 
-                    proxyDisplay = (
-                        upstreamProxy.split("://")[1]
-                        if "://" in upstreamProxy
-                        else upstreamProxy
-                    )
-
-                    exitIp = f"Tor+Proxy({proxyDisplay})"
-
-                    chain = [
-                        f"socks5://127.0.0.1:{socksPort}/",
-                        upstreamProxy + "/",
-                    ]
-
-                    with self.socketPatchLock:
-                        self.chainedSocks.setdefaultproxy()
-
-                        for hop in chain:
-                            self.chainedSocks.adddefaultproxy(
-                                *self.chainedSocks.parseproxy(hop)
-                            )
-
-                        originalSocket = socket.socket
-                        socket.socket = self.chainedSocks.socksocket
-
-                        try:
-                            response = session.request(**requestKwargs)
-                        finally:
-                            socket.socket = originalSocket
-                else:
+            if response is None:
+                if self.useProxyExit and self.proxyExitAvailable:
                     logger.warning(
                         "Overmind: No usable upstream proxies available. "
                         "Falling back to Tor-only for this request."

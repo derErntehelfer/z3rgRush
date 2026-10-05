@@ -76,11 +76,10 @@ def validateArguments(args):
         logger.info(f"Auto-configured {workers} workers for {args.circuits} circuits.")
 
     if args.use_exit_proxy and workers > 1:
-        logger.warning(
-            "--use-exit-proxy uses experimental global socket patching. "
-            "Forcing workers=1 for safety."
+        logger.info(
+            "--use-exit-proxy now uses local sidecar sockets. "
+            "Workers can remain enabled."
         )
-        workers = 1
 
     return workers
 
@@ -449,6 +448,11 @@ z3rgRush -t "http://test.com/{SWARM}" -w files.txt --post-data
         exitEvent.set()
 
         if overmind is not None:
+            try:
+                overmind.closeSidecars()
+            except Exception as err:
+                logger.error(f"Failed sidecar cleanup: {err}")
+
             try:
                 overmind.printCollectedOutput()
             except Exception as err:
