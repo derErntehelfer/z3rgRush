@@ -1,0 +1,1297 @@
+# z3rgRush/circuitOvermind.py
+import concurrent.futures
+import random
+import socket
+import sys
+import time
+import subprocess
+import threading
+import logging
+import requests
+from requests.adapters import HTTPAdapter
+from stem import Signal
+
+try:
+    import socks
+except ImportError:
+    try:
+        import pyChainedProxy as socks
+
+        sys.modules["socks"] = socks
+    except ImportError:
+        pass
+
+logger = logging.getLogger("z3rgRush.circuitOvermind")
+
+
+class circuitOvermind:
+    def __init__(
+        self,
+        torFactory,
+        headersInfo=None,
+        verbose=False,
+        returnCodes=[200],
+        proxySet=False,
+        payloadFactoryInstance=None,
+        recursion=0,
+    ):
+        self.torFactory = torFactory
+
+        # Shared sessions per circuit with enlarged connection pools
+        self.sessions = {}
+        num_circuits = len(self.torFactory.circuits)
+        pool_size = max(50, num_circuits * 10)  # Scale with circuit count
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+
+        for i in range(len(self.torFactory.circuits)):
+            session = requests.Session()
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self.sessions[i] = session
+
+        self.headerIndex = 0
+        self.returnCodes = returnCodes
+        self.verbose = verbose
+        self.collectedOutput = []
+        self.useProxyExit = proxySet
+        self.hitsFromReturnCode = []
+        self.recursion = recursion
+
+        self.circuitIps = {i: "Unknown" for i in range(num_circuits)}
+        self.circuitLastRotation = {i: 0 for i in range(num_circuits)}
+
+        self.circuitCooldownUntil = {i: 0.0 for i in range(num_circuits)}
+        self.circuitCounter = 0
+        self.counterLock = threading.Lock()
+
+        self.headerLock = threading.Lock()
+        self.codesForRotation = {403, 429, 430, 440, 449, 503, 521, 523, 524, 502, 504}
+
+        if self.useProxyExit:
+            self.upstreamProxies = self.collectProxyscrapeProxies()
+            self.badProxies = set()
+            logger.info(
+                f"Overmind: Collected {len(self.upstreamProxies)} upstream proxies"
+            )
+
+        if headersInfo and headersInfo.get("config"):
+            self.headerSets = headersInfo["config"]
+            logger.info(
+                f"Overmind: Loaded {len(self.headerSets.get('user_agents', []))} UAs from {headersInfo['file']}"
+            )
+        else:
+            self.headerSets = {
+                "user_agents": ["Mozilla/5.0 (compatible; z3rgRush/1.0)"],
+                "accept_headers": ["*/*"],
+                "accept_languages": ["en-US,en;q=0.9"],
+                "accept_encodings": ["gzip, deflate, br"],
+                "referers": ["https://www.google.com/"],
+                "sec_fetch_dest": ["document"],
+                "sec_fetch_mode": ["navigate"],
+                "sec_fetch_site": ["same-origin"],
+                "sec_ch_ua_mobile": ["?0"],
+                "sec_ch_ua_platforms": ['"Windows"'],
+            }
+            logger.info("No headers config loaded, using minimal defaults")
+
+    def collectProxyscrapeProxies(self):
+        curlCmd = [
+            "curl",
+            "-s",
+            "https://api.proxyscrape.com/v4/free-proxy-list/get?protocol=http&timeout=10000&country=all&ssl=all&anonymity=all&limit=2000&request=displayproxies",
+        ]
+        try:
+            result = subprocess.run(curlCmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                proxyLines = [
+                    line.strip()
+                    for line in result.stdout.strip().split("\n")
+                    if ":" in line
+                ]
+                return [f"http://{line}" for line in proxyLines if ":" in line][:50]
+        except Exception as e:
+            logger.error(f"Proxy collection failed: {e}")
+        return []
+
+    def getNextHeaders(self):
+        with self.headerLock:
+            self.headerIndex += 1
+            rotationIndex = self.headerIndex % 100
+
+        # Base headers applicable to all methods
+        headers = {
+            "User-Agent": self.headerSets["user_agents"][
+                rotationIndex % len(self.headerSets["user_agents"])
+            ],
+            "Accept": self.headerSets["accept_headers"][
+                (rotationIndex + 1) % len(self.headerSets["accept_headers"])
+            ],
+            "Accept-Language": self.headerSets["accept_languages"][
+                (rotationIndex + 2) % len(self.headerSets["accept_languages"])
+            ],
+            "Accept-Encoding": self.headerSets["accept_encodings"][
+                (rotationIndex + 3) % len(self.headerSets["accept_encodings"])
+            ],
+            "Referer": self.headerSets["referers"][
+                (rotationIndex + 4) % len(self.headerSets["referers"])
+            ],
+            "Connection": "keep-alive",
+        }
+
+        return headers
+
+    def printHeadersVerbose(self, headers):
+        if not self.verbose:
+            return
+        logger.debug("  Headers:")
+        for key, value in headers.items():
+            logger.debug(f"    {key}: {value}")
+
+    def getExitIp(self, proxies, timeout, headers):
+        endpoints = [
+            ("https://api.ipify.org?format=json", lambda r: r.json().get("ip")),
+            ("https://httpbin.org/ip", lambda r: r.json().get("origin")),
+            ("https://ifconfig.me/ip", lambda r: r.text.strip()),
+        ]
+        for url, parser in endpoints:
+            try:
+                ipResponse = requests.get(
+                    url, proxies=proxies, timeout=timeout, headers=headers
+                )
+                ipResponse.raise_for_status()
+                exitIp = parser(ipResponse)
+                if exitIp and ", " in exitIp:
+                    exitIp = exitIp.split(", ")[0].strip()
+                if exitIp:
+                    return exitIp
+            except Exception:
+                continue
+        return "IP fetch error"
+
+    def _fetchIpInBackground(self, circuitIndex, proxies, timeout, headers):
+        """Fetches the exit IP in a background thread to prevent blocking the main request pipeline."""
+
+        def _fetch():
+            ip = self.getExitIp(proxies, timeout, headers)
+            self.circuitIps[circuitIndex] = ip
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def rotateCircuit(self, circuitIndex, reason=None):
+        current_time = time.time()
+        if current_time - self.circuitLastRotation[circuitIndex] < 5.0:
+            return
+
+        self.circuitCooldownUntil[circuitIndex] = current_time + 15.0
+        self.circuitLastRotation[circuitIndex] = current_time
+
+        # Use a separate thread for rotation to avoid blocking
+        def do_rotation():
+            self.circuitLastRotation[circuitIndex] = time.time()
+            torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+                circuitIndex
+            ]
+            try:
+                controller.signal(Signal.NEWNYM)
+                if reason or self.verbose:
+                    logger.info(f"Overmind: Circuit {circuitIndex} rotation initiated")
+            except Exception as e:
+                logger.error(f"Failed to rotate Tor circuit: {e}")
+
+        threading.Thread(target=do_rotation, daemon=True).start()
+
+    def getAvailableCircuit(self):
+        """Returns the index of a healthy circuit, avoiding those in cooldown."""
+        current_time = time.time()
+
+        # Find circuits that are NOT in cooldown
+        available_circuits = [
+            idx
+            for idx, cooldown_time in self.circuitCooldownUntil.items()
+            if current_time >= cooldown_time
+        ]
+
+        # Fallback: If ALL circuits are in cooldown, pick the one recovering soonest
+        if not available_circuits:
+            return min(self.circuitCooldownUntil, key=self.circuitCooldownUntil.get)
+
+        # Thread-safe round-robin among healthy circuits
+        with self.counterLock:
+            idx = self.circuitCounter % len(available_circuits)
+            self.circuitCounter += 1
+
+        return available_circuits[idx]
+
+    def fetchWithCircuit(
+        self,
+        requestSpec,
+        circuitIndex,
+        data=None,
+        timeout=10,
+        customHeaders=None,
+        exitEvent=None,
+        requestKwargs=None,
+    ):
+        torProcess, controller, socksPort, dataDir = self.torFactory.circuits[
+            circuitIndex
+        ]
+        requestKwargs = requestKwargs or {}
+
+        if exitEvent is not None and exitEvent.is_set():
+            return False, requestSpec
+
+        url = requestSpec.get("url")
+        method = requestSpec.get("method", "GET")
+        headers = self.getNextHeaders()
+        with self.headerLock:
+            self.headerIndex += 1
+            rotationIndex = self.headerIndex % 100
+        if method.upper() in ["GET", "HEAD", "OPTIONS"]:
+            headers.update(
+                {
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": self.headerSets["sec_fetch_dest"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-Mode": self.headerSets["sec_fetch_mode"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-Site": self.headerSets["sec_fetch_site"][
+                        rotationIndex % 4
+                    ],
+                    "Sec-Fetch-User": "?1",
+                    "Sec-CH-UA": '"Chromium";v="129", "Not=A?Brand";v="24", "Google Chrome";v="129"',
+                    "Sec-CH-UA-Mobile": self.headerSets["sec_ch_ua_mobile"][
+                        rotationIndex % len(self.headerSets["sec_ch_ua_mobile"])
+                    ],
+                    "Sec-CH-UA-Platform": self.headerSets["sec_ch_ua_platforms"][
+                        rotationIndex % len(self.headerSets["sec_ch_ua_platforms"])
+                    ],
+                }
+            )
+        requestData = requestSpec.get("data")
+        requestJson = requestSpec.get("json")
+        contentType = requestSpec.get("contentType")
+
+        if contentType:
+            headers["Content-Type"] = contentType
+
+        if customHeaders:
+            headers.update(customHeaders)
+
+        upstreamProxy = None
+        exitIp = "Unknown"
+        session = self.sessions[circuitIndex]
+
+        try:
+            requestKwargs = {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "timeout": timeout,
+            }
+
+            if requestJson is not None:
+                requestKwargs["json"] = requestJson
+
+            elif requestData is not None:
+                requestKwargs["data"] = requestData
+
+            if self.useProxyExit:
+                availableProxies = [
+                    p for p in self.upstreamProxies if p not in self.badProxies
+                ]
+                if not availableProxies:
+                    logger.warning(
+                        "Overmind: All upstream proxies failed - refetching..."
+                    )
+                    self.upstreamProxies = self.collectProxyscrapeProxies()
+                    self.badProxies.clear()
+                    availableProxies = self.upstreamProxies
+
+                upstreamProxy = random.choice(availableProxies)
+                proxyDisplay = (
+                    upstreamProxy.split("://")[1]
+                    if "://" in upstreamProxy
+                    else upstreamProxy
+                )
+                exitIp = f"Tor+Proxy({proxyDisplay})"
+
+                import pyChainedProxy as chained_socks
+
+                chain = [f"socks5://127.0.0.1:{socksPort}/", upstreamProxy + "/"]
+                chained_socks.setdefaultproxy()
+                for hop in chain:
+                    chained_socks.adddefaultproxy(*chained_socks.parseproxy(hop))
+
+                original_socket = socket.socket
+                socket.socket = chained_socks.socksocket
+                try:
+                    response = session.request(**requestKwargs)
+                finally:
+                    socket.socket = original_socket
+            else:
+                proxies = {
+                    "http": f"socks5h://127.0.0.1:{socksPort}",
+                    "https": f"socks5h://127.0.0.1:{socksPort}",
+                }
+
+                if self.circuitIps[circuitIndex] == "Unknown":
+                    self.circuitIps[circuitIndex] = "Fetching..."
+                    self._fetchIpInBackground(circuitIndex, proxies, timeout, headers)
+                exitIp = self.circuitIps[circuitIndex]
+
+                response = session.request(**requestKwargs, proxies=proxies)
+
+            if self.verbose:
+                chain_str = (
+                    f" --> Proxy({upstreamProxy})"
+                    if self.useProxyExit and upstreamProxy
+                    else ""
+                )
+                logger.debug(
+                    f"Overmind: [CHAIN] Local --> Tor({socksPort}){chain_str} --> Exit({exitIp}) --> {url}"
+                )
+
+            resultToCollect = (
+                f"Circuit {circuitIndex} ({method}) (port {socksPort}): "
+                f"IP={exitIp}, status={response.status_code}, len={len(response.content)} "
+                f"(URL: {url})"
+            )
+            logger.info(resultToCollect)
+            self.printHeadersVerbose(headers)
+
+            if response.status_code in self.returnCodes:
+                self.collectedOutput.append(resultToCollect)
+                if self.recursion >= 1:
+                    self.hitsFromReturnCode.append((url + "/" + "{SWARM}"))
+                return (True, None)
+
+            if response.status_code in self.codesForRotation and not exitEvent.is_set():
+                logger.warning(
+                    f"Overmind: Rate limit/WAF detected (status {response.status_code}) on circuit {circuitIndex} - rotating circuit"
+                )
+                self.rotateCircuit(
+                    circuitIndex, reason=f"WAF/Rate Limit ({response.status_code})"
+                )
+                logger.info(
+                    f"Overmind: Payload {url} returned to Work Container - Response Status {response.status_code}"
+                )
+                return (False, requestSpec)
+
+            return (True, None)
+
+        except requests.exceptions.Timeout:
+            if not exitEvent.is_set():
+                if self.useProxyExit and upstreamProxy:
+                    self.badProxies.add(upstreamProxy)
+                    logger.warning(
+                        f"Overmind: [BAD PROXY] {upstreamProxy} timed out - blacklisted"
+                    )
+                logger.warning(
+                    f"Overmind: Payload {url} returned to Work Container - Timed out"
+                )
+                self.rotateCircuit(circuitIndex, reason="Timeout")
+            return (False, requestSpec)
+
+        except requests.exceptions.ConnectionError as ce:
+            if "refused" in str(ce).lower() or "reset" in str(ce).lower():
+                if not exitEvent.is_set():
+                    if self.useProxyExit and upstreamProxy:
+                        self.badProxies.add(upstreamProxy)
+                        logger.warning(
+                            f"Overmind: [BAD PROXY] {upstreamProxy} connection refused/reset - blacklisted"
+                        )
+                    logger.warning(
+                        f"Overmind: Payload {url} returned to Work Container - Connection refused"
+                    )
+                    self.rotateCircuit(circuitIndex, reason="Connection Refused/Reset")
+            return (False, requestSpec)
+
+        except Exception as e:
+            if not exitEvent.is_set():
+                if self.useProxyExit and upstreamProxy:
+                    self.badProxies.add(upstreamProxy)
+                    logger.error(
+                        f"Overmind: [BAD PROXY] {upstreamProxy} threw error {e} - blacklisted"
+                    )
+                logger.error(
+                    f"Circuit {circuitIndex} ({method}) (port {socksPort}): IP={exitIp}, error -> {e} (URL: {url})"
+                )
+                logger.warning(
+                    f"Overmind: Payload {url} returned to Work Container - Failed to Send"
+                )
+                self.rotateCircuit(
+                    circuitIndex, reason=f"Exception ({type(e).__name__})"
+                )
+            return (False, requestSpec)
+
+    def sendPayloads(
+        self,
+        payloads,
+        workers=None,
+        timeout=10,
+        postData=False,
+        customHeaders=None,
+        exitEvent=None,
+    ):
+        # Pre-allocate circuit indices to avoid contention
+        work = list(payloads)
+        maxRetries = 3
+
+        # Create the executor ONCE to avoid thread-spawning overhead
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            while (
+                work
+                and maxRetries > 0
+                and (exitEvent is None or not exitEvent.is_set())
+            ):
+                currentWork = work[:]
+                work = []
+                futures = []
+
+                try:
+                    for i, payload in enumerate(currentWork):
+                        if isinstance(payload, dict):
+                            requestSpec = payload
+                        elif postData and isinstance(payload, tuple):
+                            url, postDataValue = payload
+                            requestSpec = {
+                                "url": url,
+                                "data": postDataValue,
+                                "method": "POST",
+                                "payload": postDataValue,
+                            }
+                        else:
+                            requestSpec = {
+                                "url": payload,
+                                "data": None,
+                                "method": "GET",
+                                "payload": payload,
+                            }
+
+                        circuit_idx = self.getAvailableCircuit()
+
+                        futures.append(
+                            executor.submit(
+                                self.fetchWithCircuit,
+                                requestSpec,
+                                circuit_idx,
+                                timeout=timeout,
+                                customHeaders=customHeaders,
+                                exitEvent=exitEvent,
+                            )
+                        )
+
+                    pending = set(futures)
+                    while pending:
+                        if exitEvent is not None and exitEvent.is_set():
+                            break
+
+                        done, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=0.5,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            success, failedPayload = future.result()
+                            if (
+                                not success
+                                and failedPayload
+                                and (exitEvent is None or not exitEvent.is_set())
+                            ):
+                                work.append(failedPayload)
+
+                    maxRetries -= 1
+
+                except KeyboardInterrupt:
+                    if exitEvent is not None:
+                        exitEvent.set()
+                except Exception as e:
+                    logger.error(f"sendPayloads failed: {e}")
+                    if exitEvent is not None:
+                        exitEvent.set()
+
+        if work and (exitEvent is None or not exitEvent.is_set()):
+            logger.warning(f"Failed payloads after {maxRetries} retries: {len(work)}")
+
+    def getHitsForRecursion(self):
+        return self.hitsFromReturnCode
+
+    def cleanUrlListInRecursion(self):
+        self.hitsFromReturnCode.clear()
+
+    def printCollectedOutput(self):
+        logger.info("------ Collected Results ------")
+        if self.collectedOutput:
+            for outputs in self.collectedOutput:
+                logger.info(outputs)
+        else:
+            logger.info("No Results Collected")
+        logger.info("------ Collected Results ------")
+__version__ = "1.0.0"
+# /z3rgRush/logger.py
+import logging
+import warnings
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.theme import Theme
+from rich.highlighter import NullHighlighter  # <--- NEW IMPORT
+
+# ==============================================================================
+# SUBDUED MONOCHROMATIC THEME ("Cool Slate")
+# ==============================================================================
+cool_slate_theme = Theme(
+    {
+        # --- Logging Levels ---
+        "logging.level.debug": "dim #5C7A99",
+        "logging.level.info": "#7A98B5",
+        "logging.level.warning": "#99B3CC",
+        "logging.level.error": "#B8CCE0",
+        "logging.level.critical": "bold #D6E5F3",
+        # --- Progress Bar ---
+        "progress.description": "#7A98B5",
+        "progress.spinner": "#99B3CC",
+        "progress.bar.back": "dim #3D5266",
+        "progress.bar.complete": "#7A98B5",
+        "progress.percentage": "#8CA8C4",
+        # --- General Semantic Styles ---
+        "info": "#7A98B5",
+        "warning": "#99B3CC",
+        "danger": "#B8CCE0",
+        "error": "#B8CCE0",
+        "success": "#8CA8C4",
+        # --- Data Representation (for dicts, lists, tracebacks) ---
+        "repr.number": "#8CA8C4",
+        "repr.string": "#7A98B5",
+        "repr.bool_true": "#99B3CC",
+        "repr.bool_false": "dim #5C7A99",
+        "repr.url": "underline #99B3CC",
+        "repr.none": "dim #5C7A99",
+        # --- Tracebacks ---
+        "traceback.border": "#3D5266",
+        "traceback.title": "#B8CCE0",
+        "traceback.text": "#7A98B5",
+    }
+)
+
+# Single shared Console instance for the entire application
+# highlighter=NullHighlighter() disables automatic coloring in console.print() calls
+console = Console(theme=cool_slate_theme, highlighter=NullHighlighter())
+
+
+class StemLogFilter(logging.Filter):
+    """
+    stem sometimes internally sets its child loggers to DEBUG,
+    bypassing standard level configurations. This filter drops them.
+    """
+
+    def filter(self, record):
+        if record.name.startswith("stem") and record.levelno < logging.WARNING:
+            return False
+        return True
+
+
+class StemSocketErrorFilter(logging.Filter):
+    """Filter to suppress stem SocketClosed errors during shutdown."""
+
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Error while receiving a control message" in msg and "SocketClosed" in msg:
+            return False
+        return True
+
+
+def setup_logging(verbose=False, log_file=None):
+    log_level = logging.DEBUG if verbose else logging.INFO
+
+    rich_handler = RichHandler(
+        console=console,
+        rich_tracebacks=True,
+        tracebacks_show_locals=verbose,
+        markup=False,
+        show_time=False,
+        show_path=False,
+        highlighter=NullHighlighter(),
+    )
+
+    # Add filters to suppress stem noise
+    rich_handler.addFilter(StemLogFilter())
+    rich_handler.addFilter(StemSocketErrorFilter())
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(name)s | %(message)s",
+        datefmt="[%X]",
+        handlers=[rich_handler],
+    )
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        file_handler.addFilter(StemLogFilter())
+        file_handler.addFilter(StemSocketErrorFilter())
+        logging.getLogger().addHandler(file_handler)
+
+    # Suppress other noisy loggers
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    # Force stem to propagate so our filters can catch it
+    stem_logger = logging.getLogger("stem")
+    stem_logger.handlers.clear()
+    stem_logger.propagate = True
+
+    warnings.filterwarnings("ignore")
+
+    return logging.getLogger("z3rgRush")
+
+
+logger = setup_logging()
+# /z3rgRush/payloadFactory.py
+import os
+import sys
+import logging
+import json
+
+logger = logging.getLogger("z3rgRush.payloadFactory")
+
+
+class payloadFactory:
+    def __init__(self, wordlist, recursion):
+        self.wordlist = wordlist
+        self.recursion = recursion
+        logger.debug(f"PayloadFactory initialized with wordlist: {wordlist}")
+
+    def loadFiletypes(self, filetypeArg):
+        if not filetypeArg:
+            return [""]
+        if os.path.isfile(filetypeArg):
+            try:
+                with open(filetypeArg, "r") as f:
+                    extensions = [line.strip() for line in f if line.strip()]
+                if not extensions:
+                    logger.error(f"{filetypeArg} is empty")
+                    sys.exit(1)
+                logger.debug(f"Loaded {len(extensions)} filetypes from {filetypeArg}")
+                return extensions
+            except Exception as e:
+                logger.error(f"Error reading {filetypeArg}: {e}")
+                sys.exit(1)
+        logger.debug(f"Using single filetype: {filetypeArg}")
+        return [filetypeArg]
+
+    def iteratePayloads(
+        self, target, filetypes=None, method="GET", postData=False, bodyTemplate=None
+    ):
+        filetypes = filetypes or [""]
+
+        # Respect -m override over --post-data as per CLI documentation
+        effectiveMethod = method.upper()
+        if postData and effectiveMethod == "GET":
+            effectiveMethod = "POST"
+
+        hasBody = postData or bodyTemplate is not None
+
+        with open(self.wordlist, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                path = line.strip()
+                if not path:
+                    continue
+                for ext in filetypes:
+                    if ext.startswith("."):
+                        ext = ext.lstrip(".")
+                    pathFull = path + ("." + ext if ext else "")
+
+                # Always replace {SWARM} in URL if present, regardless of body
+                requestUrl = (
+                    target.replace("{SWARM}", pathFull)
+                    if "{SWARM}" in target
+                    else target
+                )
+
+                requestData = None
+                requestJson = None
+                contentType = None
+
+                if bodyTemplate:
+                    injectedBody = bodyTemplate.replace("{SWARM}", pathFull).strip()
+                    # Auto-detect JSON structure
+                    if (
+                        injectedBody.startswith("{") and injectedBody.endswith("}")
+                    ) or (injectedBody.startswith("[") and injectedBody.endswith("]")):
+                        try:
+                            requestJson = json.loads(injectedBody)
+                            contentType = "application/json"
+                        except json.JSONDecodeError:
+                            requestData = injectedBody
+                            contentType = "text/plain"
+                    else:
+                        requestData = injectedBody
+                        contentType = "application/x-www-form-urlencoded"
+                elif postData:
+                    requestData = pathFull
+                    contentType = "text/plain"
+
+                yield {
+                    "url": requestUrl,
+                    "data": requestData,
+                    "json": requestJson,
+                    "method": effectiveMethod,
+                    "payload": pathFull,
+                    "contentType": contentType,
+                }
+
+    def generatePayloads(self, target, filetypeArg=None, postData=False):
+        filetypes = self.loadFiletypes(filetypeArg)
+        return list(self.iteratePayloads(target, filetypes, postData=postData))
+# /z3rgRush/torCircuitFactory.py
+import shutil
+import socket
+import tempfile
+import time
+import logging
+import os
+import subprocess
+import threading
+import concurrent.futures
+from contextlib import suppress
+from stem.control import Controller
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from logger import console
+
+logger = logging.getLogger("z3rgRush.torCircuitFactory")
+
+
+class torCircuitFactory:
+    def __init__(self, numberOfCircuits=3, verbose=False):
+        self.verbose = verbose
+        self.circuits = []
+        self.dataDirs = []
+
+        console.print(f"\nInitializing {numberOfCircuits} Tor circuits in parallel...")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Building circuits...", total=numberOfCircuits)
+
+            # Build circuits in parallel using ThreadPoolExecutor
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=numberOfCircuits
+            ) as executor:
+                futures = {
+                    executor.submit(self._buildCircuit, i, 3, progress, task): i
+                    for i in range(numberOfCircuits)
+                }
+
+                for future in concurrent.futures.as_completed(futures):
+                    circuit_idx = futures[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            torProcess, controller, socksPort, dataDir = result
+                            self.circuits.append(
+                                (torProcess, controller, socksPort, dataDir)
+                            )
+                            self.dataDirs.append(dataDir)
+                    except Exception as e:
+                        logger.error(f"Circuit {circuit_idx} failed to build: {e}")
+
+        # Prevent cascade failure if all circuits fail
+        if not self.circuits:
+            logger.error("Failed to build ANY circuits. Exiting.")
+            raise RuntimeError("No circuits could be initialized.")
+
+        console.print(
+            f"All circuits initialized successfully ({len(self.circuits)} active)\n"
+        )
+
+    def _drainOutput(self, process, circuitNr):
+        """Drains stdout to prevent pipe buffer blocking."""
+        try:
+            for line in iter(process.stdout.readline, b""):
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded and self.verbose:
+                    logger.debug(f"Tor[{circuitNr}]: {decoded}")
+        except Exception:
+            pass
+
+    def _buildCircuit(
+        self, currentCircuitNr, circuitBuildRetries, progress=None, task=None
+    ):
+        if circuitBuildRetries <= 0:
+            logger.error(f"Circuit {currentCircuitNr}: Max retries reached")
+            return None
+
+        socksPort = self.findFreePort()
+        controlPort = self.findFreePort()
+        dataDir = tempfile.mkdtemp()
+
+        logger.debug(
+            f"Circuit {currentCircuitNr}: Ports {socksPort}/{controlPort}, DataDir: {dataDir}"
+        )
+
+        torConfig = {
+            "SocksPort": str(socksPort),
+            "ControlPort": str(controlPort),
+            "DataDirectory": dataDir,
+            "CookieAuthentication": "1",
+            "ExitPolicy": "reject *:*",
+            "CircuitBuildTimeout": "90",
+            "Log": ["NOTICE stdout"] if self.verbose else [],
+        }
+
+        try:
+            tor_cmd = shutil.which("tor") or "tor"
+            torrc_path = os.path.join(dataDir, "torrc")
+
+            # Write config manually
+            with open(torrc_path, "w") as f:
+                for k, v in torConfig.items():
+                    if isinstance(v, list):
+                        for item in v:
+                            f.write(f"{k} {item}\n")
+                    else:
+                        f.write(f"{k} {v}\n")
+
+            # Launch via subprocess to bypass stem's main-thread timeout restriction
+            torProcess = subprocess.Popen(
+                [tor_cmd, "-f", torrc_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            # Drain stdout in background to prevent blocking
+            threading.Thread(
+                target=self._drainOutput,
+                args=(torProcess, currentCircuitNr),
+                daemon=True,
+            ).start()
+
+            logger.debug(
+                f"Circuit {currentCircuitNr}: Tor process launched via subprocess"
+            )
+
+            # Wait for control port to become available
+            controller = None
+            for _ in range(30):
+                try:
+                    controller = Controller.from_port(port=controlPort)
+                    controller.authenticate()
+                    break
+                except Exception:
+                    time.sleep(1)
+
+            if not controller:
+                raise RuntimeError("Could not connect to Tor control port")
+
+            if progress and task:
+                progress.update(
+                    task,
+                    description=f"Circuit {currentCircuitNr + 1}: Bootstrapping...",
+                )
+
+            self.waitForBootstrap(controller, currentCircuitNr)
+
+            if progress and task:
+                progress.update(
+                    task,
+                    description=f"Circuit {currentCircuitNr + 1}: Ready",
+                    advance=1,
+                )
+
+            logger.info(f"Circuit {currentCircuitNr} ready (SOCKS: {socksPort})")
+            return (torProcess, controller, socksPort, dataDir)
+
+        except Exception as e:
+            logger.error(f"Circuit {currentCircuitNr}: {e}")
+            self.cleanupSingle(dataDir)
+
+            if progress and task:
+                progress.update(
+                    task, description=f"Circuit {currentCircuitNr + 1}: Retrying..."
+                )
+
+            return self._buildCircuit(
+                currentCircuitNr, circuitBuildRetries - 1, progress, task
+            )
+
+    def findFreePort(self, host="127.0.0.1"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, 0))
+            return sock.getsockname()[1]
+
+    def waitForBootstrap(self, controller, currentCircuitNr):
+        start_time = time.time()
+        while True:
+            if time.time() - start_time > 60:
+                raise RuntimeError("Bootstrap timed out after 60 seconds")
+
+            try:
+                status = controller.get_info("status/bootstrap-phase")
+                logger.debug(f"Circuit {currentCircuitNr}: {status}")
+
+                if "100" in status:
+                    break
+            except Exception as e:
+                logger.debug(f"Circuit {currentCircuitNr}: Control port error: {e}")
+
+            time.sleep(1)
+
+    def cleanupSingle(self, dataDir):
+        with suppress(Exception):
+            shutil.rmtree(dataDir, ignore_errors=True)
+
+    def cleanupAll(self):
+        for torProcess, controller, socksPort, dataDir in self.circuits:
+            if controller:
+                try:
+                    controller.close()
+                except Exception:
+                    pass
+
+            if torProcess is not None:
+                try:
+                    torProcess.terminate()
+                    torProcess.wait(timeout=2)
+                except Exception:
+                    try:
+                        torProcess.kill()
+                        torProcess.wait(timeout=1)
+                    except Exception:
+                        pass
+            self.cleanupSingle(dataDir)
+
+    def close(self):
+        self.cleanupAll()
+#!/usr/bin/env python3
+# /z3rgRush/z3rgRush.py
+import argparse
+import sys
+import os
+import json
+import threading
+import time
+import subprocess
+import signal
+import atexit
+import logging
+import argcomplete
+from urllib.parse import urlparse
+from circuitOvermind import circuitOvermind
+from payloadFactory import payloadFactory
+from torCircuitFactory import torCircuitFactory
+from logger import console
+
+logger = logging.getLogger("z3rgRush.main")
+
+
+exitEvent = threading.Event()
+interruptEvent = threading.Event()
+
+
+def suppressTerminalOutput():
+    subprocess.run(["stty", "-echoctl"], check=False)
+    atexit.register(lambda: subprocess.run(["stty", "echoctl"], check=False))
+
+
+def validateArguments(url, circuits, workers, postData, bodyTemplate, method):
+    parsed = urlparse(url)
+    maxCircuits = 16
+    if not parsed.scheme or parsed.scheme not in ("http", "https"):
+        logger.error(f"URL must start with http:// or https:// ('{url}')")
+        sys.exit(1)
+
+    # Check if {SWARM} is in URL OR Body Template
+    hasSwarmInUrl = "{SWARM}" in url
+    hasSwarmInBody = bodyTemplate is not None and "{SWARM}" in bodyTemplate
+
+    if not postData and not hasSwarmInUrl and not hasSwarmInBody:
+        logger.error(
+            "The '{SWARM}' placeholder must be present in the target URL or the body template (-d), "
+            "or use --post-data to use wordlist entries as the body."
+        )
+        sys.exit(1)
+
+    if circuits < 1 or circuits > maxCircuits:
+        logger.error(f"--circuits must be between 1 and {maxCircuits}")
+        sys.exit(1)
+
+    if workers is None:
+        workers = max(16, circuits * 10)
+        logger.info(f"Auto-configured {workers} workers for {circuits} circuits.")
+
+    return workers
+
+
+def parseHeadersArg(headersArg):
+    if not headersArg:
+        default_file = "headersForRotation.json"
+        if os.path.exists(default_file):
+            logger.info(f"Using default headers file: {default_file}")
+            with open(default_file, "r") as f:
+                return {"file": default_file, "config": json.load(f)}
+        else:
+            logger.info("No headers.json found, using empty header rotation")
+            return {"file": None, "config": {}}
+
+    if (
+        len(headersArg) == 1
+        and os.path.exists(headersArg[0])
+        and headersArg[0].endswith(".json")
+    ):
+        headersFile = headersArg[0]
+        logger.info(f"Loading headers from: {headersFile}")
+        try:
+            with open(headersFile, "r") as f:
+                config = json.load(f)
+            return {"file": headersFile, "config": config}
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {headersFile}: {e}")
+            sys.exit(1)
+
+    customHeaders = {}
+    for h in headersArg:
+        if ":" in h:
+            key, value = h.split(":", 1)
+            customHeaders[key.strip()] = value.strip()
+        else:
+            logger.warning(f"Invalid header format '{h}' (expected 'Key:Value')")
+    return {"file": None, "config": None, "custom": customHeaders}
+
+
+def main():
+    torFactory = None
+    overmind = None
+
+    parser = argparse.ArgumentParser(
+        description="z3rgRush - Tor-powered web fuzzer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  z3rgRush -t "http://example.com/{SWARM}" -w wordlist.txt
+  z3rgRush -t "https://target.com/{SWARM}" -w dirs.txt -f exts.txt -c 5 --workers 10
+  z3rgRush -t "http://test.com/{SWARM}" -w files.txt --post-data
+""",
+    )
+    parser.add_argument(
+        "-t",
+        "--target",
+        required=True,
+        help="Target website URL (use {SWARM} as fuzz parameter)",
+    )
+    parser.add_argument("-w", "--wordlist", required=True, help="Path to wordlist file")
+    parser.add_argument(
+        "-c",
+        "--circuits",
+        type=int,
+        default=3,
+        help="Number of Tor circuits (default: 3)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of concurrent workers (threads); defaults to number of circuits",
+    )
+    parser.add_argument(
+        "-f",
+        "--filetype",
+        default=None,
+        help="Add file extension(s) to SWARM; either a single extension (e.g. '.php') or a wordlist path",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="HTTP request timeout in seconds (default: 10.0)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output (bootstrap-phase logs)",
+    )
+    parser.add_argument(
+        "-m",
+        "--method",
+        default="GET",
+        choices=["GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE"],
+        help="HTTP method to use (default: GET). Overrides --post-data if used.",
+    )
+    parser.add_argument(
+        "--post-data",
+        action="store_true",
+        default=False,
+        help="Use wordlist entries as POST data instead of URL fuzzing",
+    )
+    parser.add_argument(
+        "-d",
+        "--body",
+        default=None,
+        help="Request body template. Use {SWARM} as the injection point. "
+        'Auto-detects JSON or Form data (e.g. -d \'{"user":"admin","pass":"{SWARM}"}\')',
+    )
+    parser.add_argument(
+        "--headers",
+        nargs="*",
+        default=[],
+        help="Headers config: JSON file path OR individual headers 'Key:Value'",
+    )
+    parser.add_argument(
+        "-rc",
+        "--return-codes",
+        nargs="*",
+        default=["200"],
+        help="HTTP status codes considered successful (default: 200)",
+    )
+    parser.add_argument(
+        "-ep",
+        "--use-exit-proxy",
+        action="store_true",
+        default=False,
+        help="Use additonal Exit proxies to hide Tor Exit Nodes (experimental)",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursion",
+        type=int,
+        default=0,
+        help="Set Recursion on hits, Value sets Depth of Recursion",
+    )
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+    args.workers = validateArguments(
+        args.target, args.circuits, args.workers, args.post_data, args.body, args.method
+    )
+
+    def handleSigint(signum, frame):
+        interruptEvent.set()
+        exitEvent.set()
+
+    signal.signal(signal.SIGINT, handleSigint)
+
+    art = [
+        " ",
+        "======================================================================",
+        "##  ███████╗██████╗ ██████╗  ██████╗ ██████╗ ██╗   ██╗███████╗██╗  ██╗",
+        "##  ╚══███╔╝╚════██╗██╔══██╗██╔════╝ ██╔══██╗██║   ██║██╔════╝██║  ██║",
+        "##    ███╔╝  █████╔╝██████╔╝██║  ███╗██████╔╝██║   ██║███████╗███████║",
+        "##   ███╔╝   ╚═══██╗██╔══██╗██║   ██║██╔══██╗██║   ██║╚════██║██╔══██║",
+        "##  ███████╗██████╔╝██║  ██║╚██████╔╝██║  ██║╚██████╔╝███████║██║  ██║",
+        "##  ╚══════╝╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚══════╝  ╚═╝",
+        "======================================================================",
+        "                                                 ## by @derErntehelfer",
+        "                                                 =====================",
+        " ",
+    ]
+    console.print("\n".join(art), style="#7A98B5")
+
+    headersInfo = parseHeadersArg(args.headers)
+    customHeaders = headersInfo.get("custom", {})
+
+    try:
+        torFactory = torCircuitFactory(
+            numberOfCircuits=args.circuits,
+            verbose=args.verbose,
+        )
+    except KeyboardInterrupt:
+        logger.warning("Interrupted during circuit building. Exiting...")
+        sys.exit(0)
+    except (OSError, RuntimeError) as e:
+        logger.error(f"Could not build Circuits: {e}")
+        exitEvent.set()
+        sys.exit(1)
+
+    payloadFactoryInstance = payloadFactory(args.wordlist, args.recursion)
+    filetypes = payloadFactoryInstance.loadFiletypes(args.filetype)
+
+    overmind = circuitOvermind(
+        torFactory,
+        headersInfo=headersInfo,
+        verbose=args.verbose,
+        returnCodes=[int(code.replace(",", "").strip()) for code in args.return_codes],
+        proxySet=args.use_exit_proxy,
+        payloadFactoryInstance=payloadFactoryInstance,
+        recursion=args.recursion,
+    )
+
+    def handleRecursion(round_depth):
+        newTargets = overmind.getHitsForRecursion()
+        if interruptEvent.is_set():
+            logger.warning("Interrupted: Skipping recursion.")
+            return
+        elif newTargets:
+            logger.info(f"Entering Recursive Fuzzing, current depth: {round_depth + 1}")
+            for url in newTargets:
+                recursionPayloads = payloadFactoryInstance.iteratePayloads(
+                    target=url,
+                    filetypes=filetypes,
+                    method=args.method,
+                    postData=args.post_data,
+                )
+                overmind.sendPayloads(
+                    recursionPayloads,
+                    workers=args.workers,
+                    timeout=args.timeout,
+                    postData=args.post_data,
+                    customHeaders=customHeaders,
+                    exitEvent=exitEvent,
+                )
+            overmind.cleanUrlListInRecursion()
+        else:
+            logger.info(
+                "No new hits collected on Recursion, ending before end of Depth is reached"
+            )
+            raise StopIteration
+
+    try:
+        payloadGenerator = payloadFactoryInstance.iteratePayloads(
+            target=args.target,
+            filetypes=filetypes,
+            method=args.method,
+            postData=args.post_data,
+            bodyTemplate=args.body,  # <--- ADD THIS
+        )
+        overmind.sendPayloads(
+            payloadGenerator,
+            workers=args.workers,
+            timeout=args.timeout,
+            postData=args.post_data,
+            customHeaders=customHeaders,
+            exitEvent=exitEvent,
+        )
+
+        if args.recursion > 0:
+            for round_depth in range(args.recursion):
+                try:
+                    handleRecursion(round_depth)
+                except StopIteration:
+                    break
+
+    except KeyboardInterrupt:
+        logger.warning("Ctrl+C received, shutting down Tor circuits...")
+        exitEvent.set()
+    except Exception as e:
+        logger.error(f"Aborting: {e}")
+    finally:
+        exitEvent.set()
+        if overmind is not None:
+            overmind.printCollectedOutput()
+        if torFactory is not None:
+            torFactory.cleanupAll()
+        logger.info("Cleanup done, exiting.")
+        time.sleep(1)
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
